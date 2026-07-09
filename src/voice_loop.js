@@ -159,10 +159,20 @@ const TTS_PIPE_MIN_CHARS = (TTS_PIPE && TTS_PIPE.minChars) || 120;   // shorter 
 const TTS_PIPE_MAX_CHUNK = (TTS_PIPE && TTS_PIPE.maxChunkChars) || 240;
 
 const MCP_MODE = (T.type === 'mcp');
+// A dead stdio pipe (the launching host exited, or a log consumer went away)
+// must never take the loop down — and CRITICALLY must never feed the crash
+// guards: an unswallowed EPIPE becomes uncaughtException -> our guard log()s ->
+// EPIPE again -> a 100%-CPU crash loop that starves signal dispatch and makes
+// the process unkillable except SIGKILL (observed under bun). Swallow at the
+// stream, and keep log() itself throw-proof.
+process.stdout.on('error', () => { /* */ });
+process.stderr.on('error', () => { /* */ });
 // In mcp mode stdout is the JSON-RPC channel — every log line MUST go to stderr.
 const log = (...a) => {
-  const line = [new Date().toISOString().slice(11, 19), ...a].map(String).join(' ');
-  if (MCP_MODE) process.stderr.write(line + '\n'); else console.log(line);
+  try {
+    const line = [new Date().toISOString().slice(11, 19), ...a].map(String).join(' ');
+    if (MCP_MODE) process.stderr.write(line + '\n'); else console.log(line);
+  } catch { /* logging must never throw */ }
 };
 function utcTs() {
   const d = new Date(), p = (n, l = 2) => String(n).padStart(l, '0');
@@ -765,12 +775,20 @@ process.on('unhandledRejection', (e) => log('[fatal] unhandledRejection', (e && 
 // (voice-down.sh / warm-servers.sh stop) own that lifecycle.
 let shuttingDown = false;
 function shutdown(sig) {
-  if (shuttingDown) return; shuttingDown = true;
-  log(`[loop] ${sig} — shutting down`);
-  try { setPresence(false); } catch { /* */ }
-  try { if (conn) conn.destroy(); } catch { /* */ }
-  try { client.destroy(); } catch { /* */ }
-  process.exit(0);
+  // A second signal exits unconditionally — if the first attempt died mid-way
+  // (see below), the latch must not make the process unkillable.
+  if (shuttingDown) process.exit(0);
+  shuttingDown = true;
+  // Everything before exit is best-effort inside one try: with our stdout/stderr
+  // pipe reader gone (host died first), even the log write can throw — and an
+  // exception here would skip process.exit, leaving a zombie that ignores
+  // SIGTERM. The finally guarantees we always exit.
+  try {
+    log(`[loop] ${sig} — shutting down`);
+    setPresence(false);
+    if (conn) conn.destroy();
+    client.destroy();
+  } catch { /* */ } finally { process.exit(0); }
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
