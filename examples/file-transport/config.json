@@ -1,0 +1,23 @@
+{
+  "_comment": "broca-machina FILE-transport example — for hosts that run their own event loop. broca-machina writes each transcript to transcriptDir/<timestamp>.txt and speaks whatever text appears in replyFile (then deletes it). Your side watches transcriptDir and writes replies to replyFile. Run file_brain.sh as a reference host loop, or wire your own. Replace every /ABS/PATH/TO/... with real absolute paths, set discord.allowedUserId to YOUR Discord user ID, and fill in the guild/channel IDs. See README.md.",
+  "discord": {
+    "guildId": "YOUR_GUILD_ID",
+    "channelId": "YOUR_VOICE_CHANNEL_ID",
+    "allowedUserId": "YOUR_DISCORD_USER_ID",
+    "tokenEnv": "DISCORD_VOICE_BOT_TOKEN"
+  },
+  "stt": {
+    "cmd": ["/ABS/PATH/TO/venv/bin/python", "/ABS/PATH/TO/broca-machina/src/stt.py"]
+  },
+  "tts": {
+    "cmd": ["/ABS/PATH/TO/venv/bin/python", "/ABS/PATH/TO/broca-machina/src/tts.py"]
+  },
+  "transport": {
+    "type": "file",
+    "transcriptDir": "/ABS/PATH/TO/broca-machina/examples/file-transport/transcripts_out",
+    "replyFile": "/ABS/PATH/TO/broca-machina/examples/file-transport/reply_in.txt"
+  },
+  "endSilenceMs": 1000,
+  "minUtteranceSec": 0.4,
+  "maxReplyChars": 700
+}

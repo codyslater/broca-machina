@@ -1,0 +1,27 @@
+node_modules/
+.voice-tmp/
+*.log
+*.pid
+
+# Your real top-level config (copied from config.example.json). Anchored to the
+# repo root so the example configs under examples/ are NOT ignored and DO ship.
+/config.json
+/.mcp.json
+
+# Local secrets + python venv — SETUP.md instructs creating both in the repo
+# root, so they MUST be ignored or `git add -A` would commit a live bot token.
+/.env
+.venv/
+
+# file-transport example scratch — users' spoken transcripts/replies land here
+# when running the example as documented; they must never become commit-eligible.
+/examples/file-transport/transcripts_out/
+/examples/file-transport/reply_in.txt
+
+# Personal, machine-specific adapters — kept on disk for local use, never
+# published. Ignores everything under adapters/ except the *.example.json templates.
+/adapters/*.json
+!/adapters/*.example.json
+
+__pycache__/
+*.pyc

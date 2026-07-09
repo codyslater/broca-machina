@@ -1,0 +1,22 @@
+{
+  "_comment": "broca-machina ECHO example — the simplest possible brain. It just repeats your words back, so you can verify the whole audio loop (mic -> STT -> brain -> TTS -> speaker) before wiring a real LLM. Replace every /ABS/PATH/TO/... below with real absolute paths and fill in the discord IDs. allowAnySpeaker:true is safe HERE because echo has no privileges — for any real brain, set discord.allowedUserId to your user ID instead. See README.md in this folder.",
+  "discord": {
+    "guildId": "YOUR_GUILD_ID",
+    "channelId": "YOUR_VOICE_CHANNEL_ID",
+    "allowAnySpeaker": true,
+    "tokenEnv": "DISCORD_VOICE_BOT_TOKEN"
+  },
+  "stt": {
+    "cmd": ["/ABS/PATH/TO/venv/bin/python", "/ABS/PATH/TO/broca-machina/src/stt.py"]
+  },
+  "tts": {
+    "cmd": ["/ABS/PATH/TO/venv/bin/python", "/ABS/PATH/TO/broca-machina/src/tts.py"]
+  },
+  "transport": {
+    "type": "command",
+    "cmd": ["bash", "/ABS/PATH/TO/broca-machina/examples/echo/echo_brain.sh"]
+  },
+  "endSilenceMs": 1000,
+  "minUtteranceSec": 0.4,
+  "maxReplyChars": 700
+}

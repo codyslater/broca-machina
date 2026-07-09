@@ -1,0 +1,23 @@
+{
+  "_comment": "broca-machina CLAUDE-CLI example — talk to Claude Code in a voice channel. The command transport runs brain.sh, which pipes $VOICE_TRANSCRIPT through `claude -p` and prints the reply. Requires Claude Code installed and on PATH. SECURITY: `claude -p` is a tool-enabled agent — keep discord.allowedUserId set to YOUR user ID so only you can drive it (a stranger's speech would otherwise be an untrusted prompt to an agent with your privileges). Replace every /ABS/PATH/TO/... with real absolute paths and fill in the IDs. See README.md.",
+  "discord": {
+    "guildId": "YOUR_GUILD_ID",
+    "channelId": "YOUR_VOICE_CHANNEL_ID",
+    "allowedUserId": "YOUR_DISCORD_USER_ID",
+    "tokenEnv": "DISCORD_VOICE_BOT_TOKEN"
+  },
+  "stt": {
+    "cmd": ["/ABS/PATH/TO/venv/bin/python", "/ABS/PATH/TO/broca-machina/src/stt.py"]
+  },
+  "tts": {
+    "cmd": ["/ABS/PATH/TO/venv/bin/python", "/ABS/PATH/TO/broca-machina/src/tts.py"]
+  },
+  "transport": {
+    "type": "command",
+    "cmd": ["bash", "/ABS/PATH/TO/broca-machina/examples/claude-cli/brain.sh"]
+  },
+  "endSilenceMs": 1000,
+  "minUtteranceSec": 0.4,
+  "maxReplyChars": 700,
+  "ackAfterMs": 600
+}

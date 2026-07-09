@@ -1,0 +1,18 @@
+{
+  "_comment": "MCP-transport adapter — the voice loop itself becomes an MCP server (transport.type='mcp'), launched by a channel-aware host such as Claude Code via .mcp.json (see .mcp.json.example at the repo root). Spoken turns arrive at the host as a channel event; the host replies by calling the `speak` tool, which voices the text back. Copy this file, set the three discord IDs, and point stt/tts at a python that has faster-whisper + piper-tts. A leading ~ is expanded only in discord.tokenFile — use absolute paths everywhere else (never ${HOME}). For lower latency, switch stt/tts to src/stt_client.py / src/tts_client.py and run scripts/warm-servers.sh — see the README.",
+  "discord": {
+    "guildId": "YOUR_GUILD_ID",
+    "channelId": "YOUR_VOICE_CHANNEL_ID",
+    "allowedUserId": "YOUR_DISCORD_USER_ID",
+    "tokenEnv": "DISCORD_VOICE_BOT_TOKEN",
+    "tokenFile": "~/.config/broca-machina/token.env"
+  },
+  "stt": { "cmd": ["python3", "src/stt.py"], "env": { "WHISPER_MODEL": "small.en" } },
+  "tts": { "cmd": ["python3", "src/tts.py"], "env": { "PIPER_VOICE": "en_US-amy-medium" } },
+
+  "_transportNote": "type='mcp' makes this process an MCP server. deliver='channel' (the only mode implemented in v1) pushes speech as a notifications/claude/channel event for Claude Code / channel-aware hosts. The deliver switch is the seam for future generic-host inbound modes (see docs/ARCHITECTURE.md).",
+  "transport": { "type": "mcp", "source": "voice", "deliver": "channel" },
+
+  "autoJoin": true,
+  "idleLeaveMs": 600000
+}

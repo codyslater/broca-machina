@@ -1,0 +1,53 @@
+{
+  "name": "broca-machina",
+  "version": "1.0.0",
+  "private": false,
+  "description": "broca ex machina — give any text 'brain' (LLM, agent, MCP server, CLI) a voice and ears in a Discord voice channel. Receive speech, transcribe, hand off, speak the reply. Works under Discord's mandatory DAVE E2EE.",
+  "keywords": [
+    "discord",
+    "voice",
+    "voice-channel",
+    "dave",
+    "e2ee",
+    "stt",
+    "tts",
+    "speech-to-text",
+    "text-to-speech",
+    "whisper",
+    "piper",
+    "llm",
+    "agent",
+    "mcp",
+    "voice-assistant",
+    "bun"
+  ],
+  "license": "MIT",
+  "author": "Cody Slater",
+  "homepage": "https://github.com/codyslater/broca-machina#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codyslater/broca-machina.git"
+  },
+  "bugs": {
+    "url": "https://github.com/codyslater/broca-machina/issues"
+  },
+  "type": "commonjs",
+  "main": "src/voice_loop.js",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "start": "bun src/voice_loop.js",
+    "test": "VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/lifecycle_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/tts_pipeline_selftest.mjs",
+    "test:vad": "python3 test/vad_selftest.py"
+  },
+  "dependencies": {
+    "@discordjs/voice": "0.19.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@snazzah/davey": "^0.1.9",
+    "discord.js": "^14.26.4",
+    "libsodium-wrappers": "^0.7.15",
+    "opusscript": "^0.0.8",
+    "prism-media": "^1.3.5"
+  }
+}

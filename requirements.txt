@@ -1,0 +1,12 @@
+# Python dependencies for the bundled STT/TTS/VAD engines (src/*.py).
+# Only needed if you use the defaults — point stt.cmd / tts.cmd at your own
+# binary to skip these entirely. Install into a venv:
+#   python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+#
+# Note: models are fetched on first run — faster-whisper downloads the Whisper
+# model, and Piper downloads the voice into ~/.cache/broca-machina/piper.
+
+faster-whisper>=1.2.0    # STT; also vendors the Silero VAD asset used by src/vad.py
+piper-tts>=1.2.0         # TTS
+onnxruntime>=1.17.0      # Silero VAD inference (src/vad.py); also pulled in by faster-whisper
+numpy>=1.24.0            # PCM/audio buffers in the VAD path

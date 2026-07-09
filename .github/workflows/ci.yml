@@ -1,0 +1,47 @@
+# CI — the three selftests + config sanity. None of it needs a Discord token,
+# a voice channel, or audio hardware: the loop is loaded with VOICE_NO_MAIN=1
+# and driven through its exported test seam (see test/*.mjs headers).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  loop:
+    name: loop selftests (bun)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: lifecycle selftest (presence-gated join/leave state machine)
+        run: VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/lifecycle_selftest.mjs
+      - name: tts pipeline + ack selftest (splitter, ack timing, phrase rotation)
+        run: VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/tts_pipeline_selftest.mjs
+      - name: example configs are valid JSON
+        run: |
+          for f in config.example.json examples/*/config.json .mcp.json.example adapters/*.example.json; do
+            python3 -c "import json; json.load(open('$f'))" || exit 1
+            echo "OK  $f"
+          done
+      - name: fail-closed gate (no allowedUserId -> refuse to start)
+        run: |
+          echo '{"discord":{"guildId":"1","channelId":"2"},"stt":{"cmd":["true"]},"tts":{"cmd":["true"]},"transport":{"type":"mcp"}}' > /tmp/nogate.json
+          if DISCORD_VOICE_BOT_TOKEN=d bun src/voice_loop.js /tmp/nogate.json; then
+            echo "expected exit 2, got 0" && exit 1
+          fi
+
+  vad:
+    name: VAD selftest (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # faster-whisper is pulled in only for its vendored Silero ONNX asset;
+      # piper-tts isn't needed (no synthesis in this suite).
+      - run: pip install numpy onnxruntime faster-whisper
+      - run: python test/vad_selftest.py

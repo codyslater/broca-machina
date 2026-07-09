@@ -1,0 +1,64 @@
+{
+  "_note": "File-transport example (the default). For the `command` transport (pipe to any LLM CLI) and other setups, see examples/ and docs/INTEGRATIONS.md. Every optional field below shows its default; delete any you don't need.",
+
+  "_securityNote": "broca-machina fails closed: it refuses to start unless you either set discord.allowedUserId (recommended — only that user's speech is transcribed) OR set discord.allowAnySpeaker:true to explicitly accept ANY speaker in the channel. Accepted speech reaches your brain directly; with a command/mcp brain (an LLM/agent), every accepted speaker inherits the brain's privileges, so treat transcripts as untrusted (prompt injection). Keep allowedUserId set for any agent brain.",
+  "discord": {
+    "guildId": "YOUR_GUILD_ID",
+    "channelId": "YOUR_VOICE_CHANNEL_ID",
+    "allowedUserId": "YOUR_DISCORD_USER_ID",
+    "tokenEnv": "DISCORD_VOICE_BOT_TOKEN"
+  },
+
+  "_sttModelNote": "WHISPER_MODEL is the STT speed/accuracy lever. Default small.en (most accurate on CPU). Set it to base.en for ~2.8x faster transcription with near-identical output on short utterances, or tiny.en for fastest/roughest — one env var, default unchanged. The warm stt_server.py reads it too (warm-servers.sh injects stt.env), so switch it here and restart the warm servers.",
+  "stt": {
+    "cmd": ["/path/to/python", "src/stt.py"],
+    "env": { "WHISPER_MODEL": "small.en", "WHISPER_COMPUTE": "int8" }
+  },
+
+  "tts": {
+    "cmd": ["/path/to/python", "src/tts.py"],
+    "speedFile": null,
+    "env": { "PIPER_VOICE": "en_US-amy-medium" }
+  },
+
+  "transport": {
+    "type": "file",
+    "transcriptDir": "/path/to/transcripts_out",
+    "replyFile": "/path/to/reply_in.txt"
+  },
+
+  "playWavFile": null,
+  "presenceFile": null,
+
+  "_presenceGating": "autoJoin=false (default) keeps the bot in the channel for the whole session. Set autoJoin=true for presence-gated behavior: the gateway stays connected but the bot only JOINS the voice channel while allowedUserId is in it (or, with allowAnySpeaker, while any non-bot member is), and LEAVES idleLeaveMs after they go (a quick rejoin cancels the leave). onPresenceEnter/onPresenceLeave run a command (detached) on those edges — e.g. warm/spin-down the STT/TTS servers so model load overlaps the join. presenceFile (optional) is kept in existence exactly while that user is in the channel, so external tooling can gate on presence without polling Discord.",
+  "autoJoin": false,
+  "idleLeaveMs": 600000,
+  "onPresenceEnter": { "cmd": ["bash", "scripts/warm-servers.sh", "start"], "env": {} },
+  "onPresenceLeave": { "cmd": ["bash", "scripts/warm-servers.sh", "stop"], "env": {} },
+
+  "endSilenceMs": 1000,
+  "minUtteranceSec": 0.4,
+  "maxReplyChars": 700,
+
+  "_vadNote": "Silero-VAD endpointing (opt-in). enabled=false (default) keeps the fixed endSilenceMs trailing-silence endpointing. enabled=true streams decoded PCM to the warm vad_server.py (start it with `warm-servers.sh start vad`, or add VOICE_WARM_VAD=1 to onPresenceEnter.env so `start` includes it) and ends the utterance the instant speech stops — typically several hundred ms sooner than the fixed timeout, without shortening endSilenceMs (which stays the fallback if the VAD server is down/unreachable). threshold/minSilenceMs/minSpeechMs are live-tunable; the defaults below are conservative starting points and want a live voice test to dial in.",
+  "vad": {
+    "enabled": false,
+    "socket": null,
+    "threshold": 0.5,
+    "negThreshold": null,
+    "minSilenceMs": 300,
+    "minSpeechMs": 150,
+    "connectTimeoutMs": 500
+  },
+
+  "_ttsPipelineNote": "Sentence-boundary TTS pipelining (opt-in). false (default) synthesizes the whole reply then plays it. true splits long replies at sentence boundaries and synthesizes chunk N+1 while chunk N plays, cutting time-to-first-audio on long replies. Only replies >= minChars are pipelined; chunks are merged up to maxChunkChars. Preserves ordering and barge-in.",
+  "ttsPipeline": { "enabled": false, "minChars": 120, "maxChunkChars": 240 },
+
+  "bargeIn": true,
+  "_ackNote": "Fast acknowledgement (perceived latency). ackAfterMs=0 (default) is off. Set it >0 to speak an ack phrase that many ms AFTER you stop talking IF the brain's real reply hasn't landed yet — a quick 'still thinking' filler that overlaps STT + brain time so a slow (LLM/agent) brain doesn't leave the channel silent. ackPhrase is a string or an array: with an array the filler rotates randomly (never the same one twice in a row) so it doesn't chant one phrase every turn. All phrases are pre-rendered at startup so firing one is instant, it works for every transport, and a fast reply preempts it (no double-talk). Good value ~600 for a slow brain; leave 0 for a fast echo/command brain.",
+  "ackAfterMs": 0,
+  "ackPhrase": ["One moment.", "Hmm, let me think.", "Just a sec.", "Okay, thinking."],
+
+  "sttNoiseDrop": ["", ".", "you", "thank you", "thanks", "bye", "you.", "thank you."],
+  "tmpDir": null
+}
