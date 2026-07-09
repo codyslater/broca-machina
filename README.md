@@ -6,7 +6,7 @@
   <a href="https://github.com/codyslater/broca-machina/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/codyslater/broca-machina/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-black?style=flat-square"></a>
   <img alt="Runtime: bun" src="https://img.shields.io/badge/runtime-bun-black?style=flat-square">
-  <img alt="Node >= 22.12" src="https://img.shields.io/badge/node-%E2%89%A5%2022.12-black?style=flat-square">
+  <img alt="Node 22.12+" src="https://img.shields.io/badge/node-%E2%89%A5%2022.12-black?style=flat-square">
   <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-black?style=flat-square">
   <img alt="MCP server" src="https://img.shields.io/badge/MCP-server-5b2be6?style=flat-square">
   <img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square">
