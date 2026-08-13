@@ -27,6 +27,8 @@
     "replyFile": "/path/to/reply_in.txt"
   },
 
+  "_mcpTransportNote": "For transport.type 'mcp' (the loop IS an MCP server; see docs/INTEGRATIONS.md): transcriptDir (optional) tees every transcript to a file so an external router can forward it; gateFile (optional) suppresses the MCP channel notification while that file exists (a router owns delivery, and the ack stays armed); replyFile (optional) is polled as an additional voice source — whatever writes it is spoken. All three default to off.",
+
   "playWavFile": null,
   "presenceFile": null,
 
@@ -55,9 +57,22 @@
   "ttsPipeline": { "enabled": false, "minChars": 120, "maxChunkChars": 240 },
 
   "bargeIn": true,
+  "_bargeConfirmNote": "Confirm-before-kill barge-in (default true when bargeIn is on). A speaking-start during bot playback DUCKS the audio to 30% and lets STT decide: real speech interrupts playback and drops any queued reply tail (classic barge-in), while a noise blob — breath, mic bump, the bot's own audio leaking into an open mic — just restores the volume, so phantom 'utterances' can no longer cut long replies off mid-sentence. Set false for the classic instant interrupt.",
+  "bargeInConfirm": true,
+  "_earconNote": "Thinking earcon (opt-in, default off). After the turn's ack, if the reply STILL hasn't landed afterMs later, a quiet ambient loop (assets/thinking.wav ships as a soft pulse; any wav works) plays at `volume` until the reply, a new utterance, or barge-in cuts it — non-verbal 'still working' for long agent-brain waits without more spoken filler.",
+  "thinkingEarcon": { "file": null, "afterMs": 4000, "volume": 0.15, "maxMs": 45000 },
   "_ackNote": "Fast acknowledgement (perceived latency). ackAfterMs=0 (default) is off. Set it >0 to speak an ack phrase that many ms AFTER you stop talking IF the brain's real reply hasn't landed yet — a quick 'still thinking' filler that overlaps STT + brain time so a slow (LLM/agent) brain doesn't leave the channel silent. ackPhrase is a string or an array: with an array the filler rotates randomly (never the same one twice in a row) so it doesn't chant one phrase every turn. All phrases are pre-rendered at startup so firing one is instant, it works for every transport, and a fast reply preempts it (no double-talk). Good value ~600 for a slow brain; leave 0 for a fast echo/command brain.",
   "ackAfterMs": 0,
   "ackPhrase": ["One moment.", "Hmm, let me think.", "Just a sec.", "Okay, thinking."],
+
+  "_addressGateNote": "Address gate (opt-in): filters out speech the enrolled speaker directs at OTHER people in the room. A wake word anywhere in the utterance delivers instantly; every other utterance is judged ADDRESSED/ASIDE by a warm local Ollama model (defaults borrowed from localAck) given the recent conversation as context. Asides are logged and teed to transcriptDir with an .aside suffix — never forwarded to the brain, never firing a filler. FAIL-OPEN: any judge error or timeout delivers normally. Cost: ~judge latency (0.5-1s) before delivery on wake-word-less turns.",
+  "addressGate": { "enabled": false, "wakeWords": ["assistant"], "ollamaHost": null, "model": null, "timeoutMs": 2500 },
+
+  "_semanticEndpointNote": "Semantic endpointing (default ON). Endpointers cut at silence, but a pause is not always the end of a thought: a transcript that sounds unfinished (trailing comma, dangling connective like 'the/and/because' — read from Whisper's own punctuation) is HELD for holdMs instead of delivered; a continuation spoken inside the window is joined into one turn, none coming it flushes as-is. Lets you keep FAST silence endpointing (low turn latency) without mid-thought cutoffs — a wrong hold costs holdMs on that turn, a wrong cut costs nothing new. Set enabled:false for strict every-pause-is-a-turn behavior.",
+  "semanticEndpoint": { "enabled": true, "holdMs": 4000 },
+
+  "_speakerGateNote": "Speaker verification (opt-in): respond only to ONE enrolled voice. refFile is the voiceprint (JSON centroid built by src/speaker.py; embedding model: sherpa-onnx, pip install sherpa-onnx + download a speaker model to ~/.cache/broca-machina/speaker/). With refFile configured but ABSENT, the loop runs a short spoken enrollment conversation on join (enrollUtterances samples; nothing said during enrollment reaches your brain), builds the voiceprint, then arms. ENFORCEMENT lives in the STT layer: set VOICE_SPEAKER_REF (and optionally VOICE_SPEAKER_THRESHOLD, default 0.5 — start LOW, e.g. 0.35, and tune UP from the scores stt logs, or your own voice may be rejected) in stt.env below. Rejected utterances transcribe to empty and are handled like phantoms. PRIVACY: samples + voiceprint are biometric data — keep refFile/enrollDir outside the repository (e.g. ~/.cache/broca-machina/speaker/). To re-enroll, delete refFile and rejoin.",
+  "speakerGate": { "refFile": null, "enrollDir": null, "enrollUtterances": 8, "buildCmd": null },
 
   "sttNoiseDrop": ["", ".", "you", "thank you", "thanks", "bye", "you.", "thank you."],
   "tmpDir": null

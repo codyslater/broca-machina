@@ -107,5 +107,22 @@ check('clean: md chars stripped + whitespace collapsed', clean('# head > quote _
 check('clean: truncated to maxReplyChars (700 default)', clean('x'.repeat(800)).length === 700);
 check('clean: plain speech untouched', clean('Just a plain sentence.') === 'Just a plain sentence.');
 
+// 10) truncateSpoken() — the cap must never stop mid-sentence (live finding:
+// hard slice at 700 cut replies mid-thought and sounded like the bot died)
+const trunc = T.truncateSpoken;
+check('trunc: under cap untouched', trunc('Short reply.', 700) === 'Short reply.');
+{
+  const t = 'A first sentence that runs a while. A second one follows here. ' .repeat(20);
+  const out = trunc(t, 700);
+  check('trunc: cap ends on a completed sentence', out.endsWith('.') && out.length <= 700);
+  check('trunc: keeps most of the budget', out.length >= 350);
+}
+{
+  const wordy = ('word ').repeat(300).trim();   // no sentence enders at all
+  const out = trunc(wordy, 700);
+  check('trunc: no sentences -> word boundary, never a torn word', out.endsWith('word') && out.length <= 700);
+}
+check('trunc: unbroken run falls back to hard cap', trunc('x'.repeat(900), 700).length === 700);
+
 console.log(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);

@@ -1,6 +1,6 @@
 {
   "name": "broca-machina",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": false,
   "description": "broca ex machina — give any text 'brain' (LLM, agent, MCP server, CLI) a voice and ears in a Discord voice channel. Receive speech, transcribe, hand off, speak the reply. Works under Discord's mandatory DAVE E2EE.",
   "keywords": [
@@ -38,8 +38,9 @@
   },
   "scripts": {
     "start": "bun src/voice_loop.js",
-    "test": "VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/lifecycle_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/tts_pipeline_selftest.mjs",
-    "test:vad": "python3 test/vad_selftest.py"
+    "test": "VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/lifecycle_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/tts_pipeline_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/singleton_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/ack_context_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/earcon_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/barge_confirm_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/capture_resilience_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/enroll_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/semantic_endpoint_selftest.mjs && VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/address_gate_selftest.mjs",
+    "test:vad": "python3 test/vad_selftest.py",
+    "test:speaker": "python3 test/speaker_gate_selftest.py"
   },
   "dependencies": {
     "@discordjs/voice": "0.19.2",

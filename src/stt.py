@@ -42,6 +42,22 @@ def transcribe(model, wav_path):
     Applies WHISPER_INITIAL_PROMPT (decoder bias) and VOICE_STT_FIXUPS
     (post-hoc word corrections) when set — see module docstring.
     """
+    # Speaker gate (VOICE_SPEAKER_REF -> centroid json, see speaker.py): an
+    # utterance whose voice doesn't match the enrolled centroid transcribes to
+    # "" — upstream already treats an empty transcript as a phantom (wait
+    # state restored, nothing forwarded), so rejection needs no caller logic.
+    # Fail-OPEN on gate errors: a broken model file must degrade to "no gate",
+    # never to a mute voice channel.
+    ref = os.environ.get("VOICE_SPEAKER_REF", "").strip()
+    if ref and os.path.exists(ref):
+        try:
+            import speaker
+            s = speaker.score(wav_path, ref)
+            if s < speaker.threshold():
+                print(f"[speaker] rejected (score {s:.2f})", file=sys.stderr)
+                return ""
+        except Exception as exc:  # noqa: BLE001 — any gate fault means "allow"
+            print(f"[speaker] gate error — allowing: {exc}", file=sys.stderr)
     kwargs = {"language": "en", "vad_filter": True}
     prompt = os.environ.get("WHISPER_INITIAL_PROMPT", "").strip()
     if prompt:

@@ -209,6 +209,8 @@ the loop polls that path, and whenever it appears, speaks its contents and delet
 writes `replyFile` becomes the voice.** This is the loosest coupling: your brain can be any process,
 in any language, that watches a directory and drops a text file. See
 [`examples/file-transport/`](examples/file-transport/) for a reference host loop.
+The file transport also supports **routing between multiple brains** — local
+or over SSH — see [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md#routing-between-multiple-brains).
 
 ### `command`
 

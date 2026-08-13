@@ -112,6 +112,192 @@ const IDLE_LEAVE_MS = CFG.idleLeaveMs || 600000;      // after the user leaves, 
 const END_SILENCE = CFG.endSilenceMs || 1000;
 const MIN_SEC = CFG.minUtteranceSec || 0.4;
 const BARGE_IN = CFG.bargeIn !== false;            // interrupt playback when the user speaks
+// Confirm-before-kill barge-in (default on): a speaking-start during playback
+// DUCKS the audio and lets STT decide — real speech interrupts exactly like
+// classic barge-in; a noise blob (breath, mic bump, the bot's own audio
+// leaking back into the mic) just restores the volume. Observed live: phantom
+// half-second "utterances" with empty STT killing multi-chunk replies
+// mid-sentence. bargeInConfirm:false restores the instant behavior.
+const BARGE_CONFIRM = BARGE_IN && CFG.bargeInConfirm !== false;
+// Speaker gate / first-run enrollment (opt-in): cfg.speakerGate.refFile is
+// the enrolled voiceprint (built by src/speaker.py; the STT layer enforces
+// the gate via VOICE_SPEAKER_REF in stt.env — a rejected voice surfaces as an
+// empty transcript and rides the existing phantom handling, no logic here).
+// The LOOP owns enrollment: refFile configured but absent -> a short scripted
+// conversation collects clean utterance samples, builds the voiceprint, then
+// normal flow resumes. During enrollment NOTHING the user says is forwarded
+// to any brain — the content is throwaway by design; only the audio matters.
+// Samples + voiceprint are biometric data: point refFile OUTSIDE the repo
+// (docs default to ~/.cache/broca-machina/speaker/).
+const SPEAKER_ENROLL = (() => {
+  const s = CFG.speakerGate;
+  if (!s || !s.refFile) return null;
+  const home = process.env.HOME || '~';
+  const ref = String(s.refFile).replace(/^~/, home);
+  const enrollDir = s.enrollDir ? String(s.enrollDir).replace(/^~/, home)
+    : path.join(path.dirname(ref), 'enroll');
+  return {
+    refFile: ref, enrollDir,
+    utterances: s.enrollUtterances || 8,
+    buildCmd: (Array.isArray(s.buildCmd) && s.buildCmd.length) ? s.buildCmd
+      : ['python3', path.join(__dirname, 'speaker.py'), 'build', enrollDir, ref],
+  };
+})();
+function enrollNeeded() { return !!SPEAKER_ENROLL && !fs.existsSync(SPEAKER_ENROLL.refFile); }
+// Enrollment-aware endpointing: reflective answers include thinking pauses
+// that command-tuned endpointing reads as end-of-utterance — cutting the
+// speaker off mid-answer and letting the next prompt talk over the rest
+// (observed live: one sample captured two answers run together). While
+// enrolling, BOTH endpointers wait substantially longer.
+const ENROLL_SILENCE_MS = (CFG.speakerGate && CFG.speakerGate.enrollMinSilenceMs) || 1500;
+function endSilenceMs() { return enrollNeeded() ? Math.max(END_SILENCE, ENROLL_SILENCE_MS) : END_SILENCE; }
+function vadMinSilenceMs() {
+  const base = (VAD && VAD.minSilenceMs != null) ? VAD.minSilenceMs : 300;
+  return enrollNeeded() ? Math.max(base, ENROLL_SILENCE_MS) : base;
+}
+// Deliberately innocuous prompts — they elicit natural speech without asking
+// for anything personal, and the answers are discarded unheard by any brain.
+const ENROLL_PROMPTS = [
+  'Nice. What is the weather like where you are today?',
+  'Tell me about something you are looking forward to this week.',
+  'Count slowly from one to ten for me.',
+  'What is your favorite way to spend a free afternoon?',
+  'Describe the room you are in right now.',
+  'Say this for me: the quick brown fox jumps over the lazy dog.',
+  'Almost done. Tell me about a movie or a book you enjoyed recently.',
+  'Last one. Read me any sentence from something nearby, or just say hello in a few different ways.',
+];
+const ENROLL_INTRO = 'Before we start, I do not have your voiceprint yet, so let me learn your voice. '
+  + 'I will ask a few easy questions; just answer naturally. First: what did you eat today?';
+function countEnrollSamples() {
+  try { return fs.readdirSync(SPEAKER_ENROLL.enrollDir).filter((f) => f.endsWith('.wav')).length; }
+  catch { return 0; }
+}
+async function enrollTurn() {
+  const n = countEnrollSamples();
+  if (n >= SPEAKER_ENROLL.utterances) {
+    log(`[enroll] ${n} samples — building voiceprint`);
+    await speak('Perfect, that is everything I need. One moment while I learn your voice.');
+    const out = await runCmd([...SPEAKER_ENROLL.buildCmd], {}, 120000);
+    if (!enrollNeeded()) {
+      log('[enroll] voiceprint built');
+      await speak('Done. From now on I only respond to your voice. If you ever want to redo this, delete the voiceprint file and rejoin.');
+    } else {
+      log('[enroll] build FAILED:', String(out).slice(0, 200));
+      await speak('Something went wrong learning your voice. I will keep listening normally for now.');
+    }
+  } else {
+    await speak(ENROLL_PROMPTS[Math.min(n - 1, ENROLL_PROMPTS.length - 1)]);
+  }
+}
+
+// Semantic endpointing (default on, semanticEndpoint.enabled=false disables):
+// endpointers cut at silence, but a pause is not always the end of a thought.
+// Instead of holding the mic open longer (latency for every turn), let the
+// cut happen FAST and judge the transcript: one that sounds unfinished is
+// HELD briefly rather than delivered — a continuation arriving inside the
+// hold window is joined into one turn; none coming, it flushes as-is. Wrong
+// hold costs holdMs of delay on that turn; wrong cut costs nothing new (it
+// is exactly the old behavior). Completeness reads Whisper's own punctuation
+// plus a dangling-connective check — deterministic, no extra model.
+const SEMANTIC = (() => {
+  const s = CFG.semanticEndpoint || {};
+  return s.enabled === false ? null : { holdMs: s.holdMs || 4000 };
+})();
+const CONNECTIVES = new Set(('and or but so because since although though if when while that which who ' +
+  'to of in on at with for from by about into onto over under between during before after ' +
+  'the a an my your his her its our their this these those ' +
+  'is are was were be being been am has have had do does did will would could should can may might must ' +
+  'i you we they he she it um uh like then also plus versus than as not very really just').split(' '));
+function looksIncomplete(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  if (/[?!]$/.test(t)) return false;          // questions/exclamations are finished thoughts
+  if (/,$/.test(t)) return true;              // Whisper heard a clause boundary, not an end
+  const last = (t.replace(/[.\s]+$/, '').split(/\s+/).pop() || '').toLowerCase().replace(/[^a-z']/g, '');
+  return CONNECTIVES.has(last);               // dangling connective — even a trailing period doesn't save it
+}
+let pendingUtterance = null;   // { text, timer } — a held, unfinished-sounding transcript
+
+// Address gate (opt-in): the microphone catches everything the enrolled
+// speaker says — including things said to OTHER PEOPLE in the room. A wake
+// word anywhere in the utterance delivers instantly; everything else is
+// judged by a warm local LLM (with the recent-turns ring as context) as
+// ADDRESSED or ASIDE. Asides are dropped: logged, teed with an .aside suffix
+// (never silently lost), no ack fired — the room conversation should not
+// hear "let me check on that". FAIL-OPEN everywhere: a judge timeout, HTTP
+// error, or unreachable model delivers normally — the voice lifeline must
+// never depend on the judge. Cost: ~judge-latency before delivery on every
+// wake-word-less turn; that is the price of catching mid-convo asides.
+const ADDRESS_GATE = (() => {
+  const a = CFG.addressGate;
+  if (!a || a.enabled !== true) return null;
+  return {
+    wakeWords: (Array.isArray(a.wakeWords) && a.wakeWords.length ? a.wakeWords : ['assistant'])
+      .map((w) => String(w).toLowerCase()),
+    ollamaHost: a.ollamaHost || (CFG.localAck && CFG.localAck.ollamaHost) || 'http://localhost:11434',
+    model: a.model || (CFG.localAck && CFG.localAck.model) || 'gemma4:e4b',
+    timeoutMs: a.timeoutMs || 2500,
+  };
+})();
+function hasWakeWord(text) {
+  if (!ADDRESS_GATE) return false;
+  const t = String(text || '').toLowerCase();
+  return ADDRESS_GATE.wakeWords.some((w) =>
+    new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t));
+}
+async function judgeAddressed(text) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ADDRESS_GATE.timeoutMs);
+  try {
+    const resp = await fetch(`${ADDRESS_GATE.ollamaHost}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ac.signal,
+      body: JSON.stringify({
+        model: ADDRESS_GATE.model,
+        messages: [
+          { role: 'system', content: 'You watch a voice channel where one user talks to a voice '
+            + 'assistant, but the microphone also catches things the user says to other people in '
+            + 'the room. Given the recent conversation and a new utterance, decide whether the new '
+            + 'utterance is addressed to the assistant or is an aside to someone else. Reply with '
+            + 'exactly one word: ADDRESSED or ASIDE. When unsure, reply ADDRESSED.' },
+          ...recentTurns.map((t) => ({ role: t.role, content: t.text })),
+          { role: 'user', content: `New utterance: "${text}"` },
+        ],
+        stream: false,
+        think: false,
+        options: { num_predict: 5 },
+      }),
+    });
+    if (!resp.ok) { log('[address] judge http', resp.status, '— allowing'); return true; }
+    const body = await resp.json();
+    const out = ((body && body.message && body.message.content) || '').trim().toUpperCase();
+    return !out.includes('ASIDE');
+  } catch (e) {
+    log('[address] judge err — allowing:', (e && e.message) || String(e));
+    return true;
+  } finally { clearTimeout(timer); }
+}
+async function deliverTranscript(text) {
+  if (ADDRESS_GATE && !hasWakeWord(text) && !(await judgeAddressed(text))) {
+    log(`[address] aside dropped: "${text.slice(0, 60)}"`);
+    ackArmedAt = 0;   // no reply is coming and none should be promised
+    if (T.transcriptDir) {
+      try { fs.writeFileSync(path.join(T.transcriptDir, `${utcTs()}.aside`), text); }
+      catch (e) { log('[address] aside tee err', e.message); }
+    }
+    return;
+  }
+  if (LOCAL_ACK) dispatchLocalAck(text, ackGeneration);   // fire-and-forget, races the real reply
+  return sendTranscript(text);
+}
+
+// Capture watchdog: a capture that outlives this is force-finalized — a
+// decoder crash or a stream that never ends must cost one utterance, not the
+// session (observed live: a WASM opus-decoder crash mid-capture left
+// capturing=true forever → deaf loop until restart). 0 disables.
+const MAX_CAPTURE_MS = (CFG.maxCaptureSec != null ? CFG.maxCaptureSec : 60) * 1000;
 const ACK_AFTER_MS = CFG.ackAfterMs || 0;          // 0 = off; else speak an ack phrase this long AFTER end-of-speech
 // ackPhrase: string OR array of strings. With several phrases the ack rotates
 // randomly (never the same one twice in a row) so a slow brain doesn't chant
@@ -124,9 +310,46 @@ const ACK_PHRASES = (() => {
 })();
 const CMD_TIMEOUT_MS = CFG.cmdTimeoutMs || 60000;   // hard cap on an STT/TTS/brain subprocess; kill + empty on expiry
 const PLAY_TIMEOUT_MS = CFG.playTimeoutMs || 60000; // safety cap so a single playback can't wedge the loop forever
+// Thinking earcon (opt-in): a quiet ambient loop that fills the silence AFTER
+// the turn's ack while the reply is still cooking, cut instantly by a reply,
+// a new utterance, or barge-in. Non-verbal on purpose — more spoken filler
+// fatigues on long waits; a low ambient cue reads as "still working" without
+// demanding attention.
+const EARCON = (() => {
+  const e = CFG.thinkingEarcon;
+  if (!e || !e.file) return null;
+  const f = String(e.file).replace(/^~/, process.env.HOME || '~');
+  if (!fs.existsSync(f)) { console.error(`broca-machina: thinkingEarcon.file not found: ${f} — earcon disabled`); return null; }
+  return { file: f, afterMs: e.afterMs || 4000, volume: e.volume || 0.15, maxMs: e.maxMs || 45000 };
+})();
 const NOISE = new Set((CFG.sttNoiseDrop || ['', '.', 'you', 'thank you', 'thanks', 'bye', 'you.', 'thank you.']).map((s) => s.toLowerCase()));
 const TMPDIR = CFG.tmpDir || path.join(path.dirname(path.resolve(CFG_PATH)), '.voice-tmp');
 fs.mkdirSync(TMPDIR, { recursive: true });
+// Singleton guard: instances sharing a tmpDir share sockets AND the voice
+// channel — duplicates race the join, and the loser's failure mode is silent
+// wrongness (transcripts delivered to whichever host spawned the winner), not
+// a crash. Leaked launcher orphans made this bite live. First boot owns the
+// dir via loop.pid; later boots must refuse loudly, naming the holder.
+const LOOP_PIDFILE = path.join(TMPDIR, 'loop.pid');
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return !!e && e.code === 'EPERM'; }
+}
+function acquireSingleton(dir) {
+  const pf = path.join(dir, 'loop.pid');
+  try {
+    const prev = parseInt(fs.readFileSync(pf, 'utf8').trim(), 10);
+    if (Number.isFinite(prev) && prev > 0 && prev !== process.pid && pidAlive(prev)) {
+      // /proc cmdline guards against PID reuse claiming to be a holder; where
+      // /proc is unreadable (non-Linux), any live pid in the file wins.
+      let cmd = null;
+      try { cmd = fs.readFileSync(`/proc/${prev}/cmdline`, 'utf8'); } catch { /* non-Linux */ }
+      if (cmd === null || cmd.includes('voice_loop')) return { ok: false, holder: prev };
+    }
+  } catch { /* no pidfile yet — ours to take */ }
+  fs.writeFileSync(pf, String(process.pid));
+  return { ok: true, holder: process.pid };
+}
 // Sweep scratch WAVs orphaned by a previous crash (normal runs unlink as they
 // go, so anything matching here is dead). Boot-time only — nothing is in
 // flight yet — and best-effort: hygiene must never block a start.
@@ -135,7 +358,7 @@ try {
     if (/^(utt_|reply_)\d{8}_\d{6}_\d{6}\.wav$/.test(f)) fs.unlinkSync(path.join(TMPDIR, f));
   }
 } catch { /* */ }
-if (T.type === 'file') fs.mkdirSync(T.transcriptDir, { recursive: true });
+if (T.transcriptDir) fs.mkdirSync(T.transcriptDir, { recursive: true });
 
 // Silero-VAD endpointing (opt-in). When enabled, decoded PCM is streamed to a
 // warm vad_server.py that reports end-of-speech the instant the speaker stops,
@@ -158,6 +381,59 @@ const TTS_PIPE = (CFG.ttsPipeline === true)
 const TTS_PIPE_MIN_CHARS = (TTS_PIPE && TTS_PIPE.minChars) || 120;   // shorter replies stay one-shot
 const TTS_PIPE_MAX_CHUNK = (TTS_PIPE && TTS_PIPE.maxChunkChars) || 240;
 
+// Local-LLM instant ack (opt-in, GPU Phase-2 tier-1 — additive, NOT a
+// replacement for the fixed ackPhrase pool above or the real reply). When
+// enabled, a warm local Ollama model generates a short, CONTENT-CONNECTED
+// holding phrase right after STT resolves (in parallel with delivering the
+// transcript to the real brain — see dispatchLocalAck() + its call site in
+// finalize()), but it only PLAYS at fireAfterMs if the real reply hasn't
+// landed by then — a fast answer means no filler at all, and the canned
+// ackPhrase tier becomes the same-moment fallback (one filler per turn, see
+// pollReply()). Default OFF -> the loop is byte-for-byte unchanged.
+// Fail-open by construction: any Ollama/network/TTS failure just means no
+// local ack plays for that turn — the fixed ackPhrase (tier-0) and the real
+// reply (tier-2) are completely unaffected either way. Pairs with
+// docs/LATENCY.md's existing ack-tier writeup; the local model is one a
+// deployment typically already keeps warm for other jobs (Ollama
+// persistence), so the ack rides existing infrastructure.
+const LOCAL_ACK = (CFG.localAck && CFG.localAck.enabled === true) ? {
+  ollamaHost: CFG.localAck.ollamaHost || 'http://localhost:11434',
+  model: CFG.localAck.model || 'gemma4:e4b',
+  numPredict: CFG.localAck.numPredict || 30,
+  systemPrompt: CFG.localAck.systemPrompt ||
+    'You are the instant spoken acknowledgment layer of a voice assistant. A slower main ' +
+    'model is preparing the real answer; your one line plays only when that answer is taking ' +
+    'a while, right before it. Acknowledge THIS specific question so the wait feels attended ' +
+    'to: name what it\'s about naturally, in a casual spoken register, 4-10 words. Reusing ' +
+    'the key term the user said (a name, a task, a thing) is good — "let me check on those ' +
+    'logs", "having a look at the deploy" — but never repeat their whole sentence, and NEVER ' +
+    'answer, guess, preview, or add facts: anything substantive will duplicate or contradict ' +
+    'the real answer. Plain spoken prose; no lists, no questions back.',
+  timeoutMs: CFG.localAck.timeoutMs || 4000,
+  fireAfterMs: CFG.localAck.fireAfterMs || 2000,
+  contextTurns: CFG.localAck.contextTurns || 6,
+} : null;
+// Rolling window of recent HEARD turns (user transcripts + replies that were
+// actually spoken) for the tier-1 ack: without it the local model sees four
+// words and invents a connection; with it the filler continues the live
+// thread. Hard-truncated per turn — the warm model's prompt must stay tiny
+// (the whole tier lives on a sub-second budget).
+const recentTurns = [];
+function recordTurn(role, text) {
+  const t = String(text || '').trim().slice(0, 200);
+  if (!t) return;
+  recentTurns.push({ role, text: t });
+  const cap = (LOCAL_ACK && LOCAL_ACK.contextTurns) || 6;
+  while (recentTurns.length > cap) recentTurns.shift();
+}
+// One filler per turn, fired only on a real wait: with LOCAL_ACK enabled the
+// single fire point for BOTH ack tiers moves to fireAfterMs — a reply landing
+// before it means no filler at all ("it doesn't have to fire every time").
+// The content-aware ack still GENERATES right after STT (so it's ready in
+// time); it just doesn't PLAY before the fire point. Without LOCAL_ACK the
+// canned tier keeps its own ackAfterMs, byte-for-byte the old behavior.
+const ACK_FIRE_MS = LOCAL_ACK ? LOCAL_ACK.fireAfterMs : 0;   // 0 = use ACK_AFTER_MS
+
 const MCP_MODE = (T.type === 'mcp');
 // A dead stdio pipe (the launching host exited, or a log consumer went away)
 // must never take the loop down — and CRITICALLY must never feed the crash
@@ -167,11 +443,31 @@ const MCP_MODE = (T.type === 'mcp');
 // stream, and keep log() itself throw-proof.
 process.stdout.on('error', () => { /* */ });
 process.stderr.on('error', () => { /* */ });
+// Persistent sink (cfg.logFile): in mcp mode stderr belongs to the launching
+// host, which may retain it only sporadically — without a file the loop owns,
+// a live incident is undebuggable after the fact. Append-mode fd + sync line
+// writes (ordered, throw-proof); boot-time rotation caps growth.
+let LOG_FD = null;
+if (CFG.logFile) {
+  try {
+    const lf = String(CFG.logFile).replace(/^~/, process.env.HOME || '~');
+    try { if (fs.statSync(lf).size > 5 * 1024 * 1024) fs.renameSync(lf, lf + '.1'); }
+    catch { /* no file yet */ }
+    fs.mkdirSync(path.dirname(lf), { recursive: true });
+    LOG_FD = fs.openSync(lf, 'a');
+  } catch (e) { console.error(`broca-machina: cannot open logFile ${CFG.logFile}: ${e.message}`); }
+}
 // In mcp mode stdout is the JSON-RPC channel — every log line MUST go to stderr.
 const log = (...a) => {
   try {
-    const line = [new Date().toISOString().slice(11, 19), ...a].map(String).join(' ');
+    const iso = new Date().toISOString();
+    const line = [iso.slice(11, 19), ...a].map(String).join(' ');
     if (MCP_MODE) process.stderr.write(line + '\n'); else console.log(line);
+    if (LOG_FD != null) {
+      // Full date in the file — it spans days; stderr stays short-form.
+      try { fs.writeSync(LOG_FD, iso + ' ' + a.map(String).join(' ') + '\n'); }
+      catch { LOG_FD = null; }   // dead disk/fd: stop paying for it, keep stderr
+    }
   } catch { /* logging must never throw */ }
 };
 function utcTs() {
@@ -210,13 +506,28 @@ function pcmToWav(pcm, outPath) {
     ff.stdin.write(pcm); ff.stdin.end();
   });
 }
+// Cap enforcement that never stops mid-sentence: a raw slice at the cap
+// sounds like the bot died mid-thought (live finding, 2026-08-10 — two
+// replies landed at 697 and 696 of a 700 cap, each cut inside a sentence).
+// Prefer the last completed sentence inside the cap; fall back to a word
+// boundary only when the last sentence end is unusably early.
+function truncateSpoken(t, cap) {
+  if (t.length <= cap) return t;
+  const cut = t.slice(0, cap);
+  const s = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '),
+    cut.endsWith('.') || cut.endsWith('!') || cut.endsWith('?') ? cap - 1 : -1);
+  if (s >= cap * 0.5) return cut.slice(0, s + 1).trim();
+  const w = cut.lastIndexOf(' ');
+  return (w > 0 ? cut.slice(0, w) : cut).trim();
+}
 function cleanForTTS(t) {
-  return t
+  const cleaned = t
     .replace(/```[\s\S]*?```/g, ' ').replace(/`([^`]*)`/g, '$1')
     .replace(/\*\*([^*]*)\*\*/g, '$1').replace(/\*([^*]*)\*/g, '$1')
     .replace(/https?:\/\/\S+/g, 'a link')
     .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu, '')
-    .replace(/[#>_~|*`]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, CFG.maxReplyChars || 700);
+    .replace(/[#>_~|*`]/g, ' ').replace(/\s+/g, ' ').trim();
+  return truncateSpoken(cleaned, CFG.maxReplyChars || 700);
 }
 
 // Presence marker — reflects whether the allowed user is currently connected to
@@ -244,16 +555,30 @@ let presenceActive = false; // is the allowed user currently in the channel
 
 function handleUtterance(userId, opus) {
   capturing = true;
-  // The user is talking again — cancel any ack still pending from the previous
-  // turn, or it could fire mid-utterance and talk over them (no speaking.start
-  // edge arrives during continuous speech, so barge-in couldn't stop it). This
-  // turn's finalize() re-arms at its own end-of-speech. Safe for the command
-  // transport: no new capture can start while its brain runs (capturing gate).
+  // The user is (maybe) talking — mute the pending-ack timer so a filler
+  // can't fire mid-utterance and talk over them (no speaking.start edge
+  // arrives during continuous speech, so barge-in couldn't stop it). In
+  // confirm mode that mute is the ONLY reset taken on faith: a capture must
+  // not destroy wait-state it can't give back, so the generation bump, the
+  // pending content-ack drop, and the queued-reply drop all wait for
+  // finalize()'s STT verdict — a phantom (empty STT) restores the arm and
+  // the earcon gate; confirmed speech commits everything. Legacy mode keeps
+  // the original instant resets.
+  const priorArmedAt = ackArmedAt, priorAcked = ackedThisTurn;
   ackArmedAt = 0;
+  stopEarcon();   // instant cut — ambient "working" over (possible) speech reads as not listening
+  if (!BARGE_CONFIRM) {
+    ackGeneration++;
+    if (pendingAck) { try { fs.unlinkSync(pendingAck.wav); } catch { /* */ } pendingAck = null; }
+    // Multi-speak: the user talking over a queued monologue means they've
+    // moved on — its unspoken tail must not resume after their new question.
+    if (replyQueue.length) { log(`[reply] dropped ${replyQueue.length} queued — user is speaking`); replyQueue = []; }
+  }
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   const chunks = [];
   let finalized = false;
   let monitor = null;
+  let captureWatchdog = null;
 
   // Single idempotent end-of-utterance path — fires from whichever endpointer
   // wins: the fixed-silence AfterSilence 'end' (default / fallback) or, when
@@ -262,28 +587,91 @@ function handleUtterance(userId, opus) {
   const finalize = async (reason) => {
     if (finalized) return;
     finalized = true;
+    if (captureWatchdog) clearTimeout(captureWatchdog);
     if (monitor) { try { monitor.close(); } catch { /* */ } }
-    // Only the VAD path ends early — free the subscription so the next utterance
-    // can re-capture immediately rather than waiting out END_SILENCE. The natural
-    // 'silence' end has already closed it.
-    if (reason === 'vad') { try { opus.destroy(); } catch { /* */ } }
+    // The VAD path ends early and the watchdog ends a stream that may never
+    // end on its own — both must free the subscription so the next utterance
+    // can re-capture immediately. The natural 'silence' end has already
+    // closed it.
+    if (reason === 'vad' || reason === 'watchdog') { try { opus.destroy(); } catch { /* */ } }
     try {
       const pcm = Buffer.concat(chunks);
       const secs = pcm.length / (48000 * 2 * 2);
-      if (secs < MIN_SEC) { log(`[recv] ${secs.toFixed(2)}s too short`); return; }
+      if (secs < MIN_SEC) {
+        log(`[recv] ${secs.toFixed(2)}s too short`);
+        if (BARGE_CONFIRM) { ackArmedAt = priorArmedAt; ackedThisTurn = priorAcked; }
+        restorePlayback(); return;
+      }
       // Arm the "still thinking" ack at end-of-speech — BEFORE STT — so the quick
       // acknowledgement overlaps STT + brain time instead of waiting them out.
-      if (ACK_AFTER_MS) { ackArmedAt = Date.now(); ackedThisTurn = false; }
+      // LOCAL_ACK arms too: its fire gate reads ackArmedAt even when the canned
+      // tier is configured off.
+      if (ACK_AFTER_MS || LOCAL_ACK) { ackArmedAt = Date.now(); ackedThisTurn = false; }
       const wav = path.join(TMPDIR, `utt_${utcTs()}.wav`);
       await pcmToWav(pcm, wav);
       log(`[recv] ${secs.toFixed(1)}s -> STT (${reason})`);
       const text = (await runCmd([...STT_CMD, wav], (CFG.stt && CFG.stt.env) || {})).trim();
+      // Enrollment collects the AUDIO of utterances that pass the same
+      // quality checks as real turns (non-empty STT = actual speech).
+      const enrolling = SPEAKER_ENROLL && enrollNeeded();
+      if (enrolling && text && text.length >= 3 && !NOISE.has(text.toLowerCase())) {
+        try {
+          fs.mkdirSync(SPEAKER_ENROLL.enrollDir, { recursive: true });
+          fs.copyFileSync(wav, path.join(SPEAKER_ENROLL.enrollDir, `sample_${utcTs()}.wav`));
+        } catch (e) { log('[enroll] sample copy err', e.message); }
+      }
       fs.unlink(wav, () => {});
       // Dropped utterance -> no dispatch -> no reply will ever come. Disarm the
       // ack or it would fire and promise a reply that never arrives.
-      if (!text || text.length < 3 || NOISE.has(text.toLowerCase())) { ackArmedAt = 0; log(`[stt] drop: "${text}"`); return; }
+      if (!text || text.length < 3 || NOISE.has(text.toLowerCase())) {
+        // Phantom: give back the wait state this capture muted at start — the
+        // previous turn's promise (ack arm + earcon gate) is still owed.
+        if (BARGE_CONFIRM) { ackArmedAt = priorArmedAt; ackedThisTurn = priorAcked; }
+        else ackArmedAt = 0;
+        log(`[stt] drop: "${text}"`); restorePlayback(); return;
+      }
       log(`[stt] "${text}"`);
-      await sendTranscript(text);
+      // Real speech: NOW commit the turn-boundary resets deferred at capture
+      // start — interrupt playback and queued tail, invalidate the previous
+      // turn's in-flight ack, drop any held content-ack as stale.
+      if (BARGE_CONFIRM) {
+        confirmBarge();
+        ackGeneration++;
+        if (pendingAck) { try { fs.unlinkSync(pendingAck.wav); } catch { /* */ } pendingAck = null; }
+      }
+      if (enrolling) {
+        // Enrollment turns never reach a brain — content is discarded.
+        log(`[enroll] sample ${countEnrollSamples()}/${SPEAKER_ENROLL.utterances}`);
+        ackArmedAt = 0;   // no reply is coming; a "still thinking" filler would lie
+        enrollTurn().catch((e) => log('[enroll] err', e.message));
+        return;
+      }
+      if (SEMANTIC) {
+        let full = text;
+        if (pendingUtterance) {   // this utterance continues a held one
+          clearTimeout(pendingUtterance.timer);
+          full = `${pendingUtterance.text} ${text}`;
+          pendingUtterance = null;
+          log(`[semantic] joined continuation -> "${full.slice(0, 70)}"`);
+        }
+        if (looksIncomplete(full)) {
+          log(`[semantic] holding — sounds unfinished: "...${full.slice(-40)}"`);
+          const held = full;
+          pendingUtterance = {
+            text: held,
+            timer: setTimeout(() => {
+              if (!pendingUtterance || pendingUtterance.text !== held) return;
+              pendingUtterance = null;
+              log('[semantic] flush — no continuation came');
+              deliverTranscript(held);
+            }, SEMANTIC.holdMs),
+          };
+          return;
+        }
+        await deliverTranscript(full);
+      } else {
+        await deliverTranscript(text);
+      }
     } finally { capturing = false; }
   };
 
@@ -295,7 +683,7 @@ function handleUtterance(userId, opus) {
           sample_rate: 48000, channels: 2,
           threshold: (VAD.threshold != null ? VAD.threshold : 0.5),
           neg_threshold: (VAD.negThreshold != null ? VAD.negThreshold : null),
-          min_silence_ms: (VAD.minSilenceMs != null ? VAD.minSilenceMs : 300),
+          min_silence_ms: vadMinSilenceMs(),
           min_speech_ms: (VAD.minSpeechMs != null ? VAD.minSpeechMs : 150),
         },
         connectTimeoutMs: (VAD.connectTimeoutMs != null ? VAD.connectTimeoutMs : 500),
@@ -309,15 +697,35 @@ function handleUtterance(userId, opus) {
   opus.on('error', (e) => log('[recv] opus err', e.message));
   opus.pipe(decoder);
   opus.on('end', () => finalize('silence'));
+  if (MAX_CAPTURE_MS > 0) {
+    captureWatchdog = setTimeout(() => {
+      log('[watchdog] capture exceeded max — force-finalizing');
+      finalize('watchdog');
+    }, MAX_CAPTURE_MS);
+  }
 }
 
 // transport.out — deliver a transcript to the brain
 async function sendTranscript(text) {
+  recordTurn('user', text);
   if (T.type === 'command') {
     const reply = (await runCmd([...T.cmd], { VOICE_TRANSCRIPT: text })).trim();
     if (reply) enqueueReply(reply);
     else ackArmedAt = 0;   // the brain finished with silence — nothing is coming; don't ack a reply that won't
   } else if (T.type === 'mcp') {
+    // Tee first: when a router owns delivery (gateFile present) this file is
+    // the ONLY copy of the utterance, and even ungated a notify failure must
+    // not lose it.
+    if (T.transcriptDir) {
+      try { fs.writeFileSync(path.join(T.transcriptDir, `${utcTs()}.txt`), text); log('[out] -> transcriptDir (tee)'); }
+      catch (e) { log('[tee] err', e.message); }
+    }
+    if (T.gateFile && fs.existsSync(T.gateFile)) {
+      // A router owns this turn; its reply is expected via replyFile, so the
+      // ack stays armed to cover the round trip.
+      log('[mcp] gated — transcript teed only');
+      return;
+    }
     // Reply comes back via the `speak` tool (-> enqueueReply); the ack was
     // already armed at end-of-speech.
     try { await deliverInboundMcp(text); }
@@ -329,8 +737,22 @@ async function sendTranscript(text) {
 }
 
 // transport.in — a reply arrived; speak it. For 'file' transport we poll replyFile.
-function enqueueReply(text) { pendingReply = text; }
-let pendingReply = null;
+// Multi-speak FIFO: each speak-tool call (or transport reply) queues; the
+// poller voices them strictly in order, one per poll pass. This is what lets
+// a brain start talking before it has finished composing — send the first
+// paragraph as its own speak call, keep composing, send the next. A new
+// utterance from the user drops whatever is still queued (an interrupted
+// monologue's tail must not resume after their next question).
+function enqueueReply(text) { replyQueue.push(text); }
+let replyQueue = [];
+// Tier-1 local ack (see LOCAL_ACK): { wav, text } once dispatchLocalAck()
+// succeeds, else null. Consumed by pollReply() exactly like pendingReply,
+// just lower priority (see the two-clear there).
+let pendingAck = null;
+// Bumped on every new utterance (handleUtterance) so a dispatchLocalAck()
+// call still in flight from a PREVIOUS turn can detect it's stale and
+// discard its result instead of setting pendingAck late.
+let ackGeneration = 0;
 
 // Split a reply into speakable chunks at sentence boundaries, merged up to
 // `max` chars (and hard-split if a single sentence still exceeds it). Pure +
@@ -372,6 +794,80 @@ async function synthWav(text) {
   await runCmd([...TTS_CMD, text, wav], ttsEnv());
   if (!fs.existsSync(wav) || fs.statSync(wav).size < 100) return null;
   return wav;
+}
+
+// Tier-1 local ack (GPU Phase-2, opt-in via LOCAL_ACK). Calls a warm local
+// Ollama model for a short, CONTENT-AWARE holding phrase, then synthesizes it
+// via the same Piper path as every other reply (synthWav). Fire-and-forget
+// from finalize() — NEVER awaited by the STT/transport path, and NEVER
+// throws: any failure (Ollama unreachable/timeout, empty content, TTS
+// failure) just means no local ack for this turn. Sets `pendingAck` only on
+// full success; pollReply() picks it up on its next tick exactly like any
+// other queued item (see the two-clear in pollReply's pendingReply branch).
+//
+// think:false is load-bearing, not cosmetic: Gemma 4 emits a hidden
+// "thinking" field before "content" on /api/chat, and a bounded num_predict
+// without think:false truncates mid-thinking, silently producing an EMPTY
+// content string (found + fixed while benchmarking the local model on GPU;
+// symptom: acks that synthesize zero-length audio).
+async function dispatchLocalAck(text, myGeneration) {
+  if (!LOCAL_ACK) return;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), LOCAL_ACK.timeoutMs);
+  try {
+    const resp = await fetch(`${LOCAL_ACK.ollamaHost}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ac.signal,
+      body: JSON.stringify({
+        model: LOCAL_ACK.model,
+        messages: [
+          { role: 'system', content: LOCAL_ACK.systemPrompt + (recentTurns.length
+            ? ' Earlier turns are context — continue that thread naturally; never repeat an earlier filler.' : '') },
+          ...recentTurns.map((t) => ({ role: t.role, content: t.text })),
+          { role: 'user', content: text },
+        ],
+        stream: false,
+        think: false,
+        options: { num_predict: LOCAL_ACK.numPredict },
+      }),
+    });
+    if (!resp.ok) { log('[localAck] ollama http', resp.status); return; }
+    const body = await resp.json();
+    const ackText = ((body && body.message && body.message.content) || '').trim();
+    if (!ackText) { log('[localAck] empty content'); return; }
+    // Stale-turn guard: the user may have started a new utterance (generation
+    // bumped, see handleUtterance) while this call was in flight — a late ack
+    // for an old turn must never queue.
+    if (myGeneration !== ackGeneration) { log('[localAck] discarded — stale turn'); return; }
+    const wav = await synthWav(ackText);
+    if (!wav) { log('[localAck] tts failed'); return; }
+    // Re-check after the (also async) TTS step — the turn went stale, the real
+    // reply already landed while we were synthesizing (voicing "let me check
+    // that" AFTER the real answer arrived would read as broken), or the canned
+    // tier already fired this turn's one allowed filler.
+    if (myGeneration !== ackGeneration || replyQueue.length || ackedThisTurn) {
+      try { fs.unlinkSync(wav); } catch { /* */ }
+      log('[localAck] discarded — stale turn, reply pending, or ack already fired');
+      return;
+    }
+    pendingAck = { wav, text: ackText };
+    log(`[localAck] "${ackText}"`);
+  } catch (e) {
+    log('[localAck] err', (e && e.message) || String(e));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Plays a tier-1 local-ack WAV exactly like speakAck() plays a tier-0 fixed
+// one — same botSpeaking discipline, same barge-in exposure (onSpeakingStart
+// already stops whatever `player` is doing, so this inherits that for free).
+async function speakLocalAck(ack) {
+  if (!connected || !player) { try { fs.unlinkSync(ack.wav); } catch { /* */ } return; }
+  botSpeaking = true;
+  try { log(`[localAck] speaking "${ack.text}"`); await playResource(fs.createReadStream(ack.wav)); }
+  finally { botSpeaking = false; fs.unlink(ack.wav, () => {}); }
 }
 
 // Pre-render every ack phrase ONCE so firing the "still thinking" ack is an
@@ -433,8 +929,51 @@ function ackDue(now, armedAt, acked, afterMs) {
   return afterMs > 0 && armedAt > 0 && !acked && (now - armedAt) >= afterMs;
 }
 
+// Pure predicate (exported): is the thinking earcon due? Only on a turn that
+// already got its one ack (the earcon EXTENDS the ack, never replaces it),
+// after the ack fire-point plus the earcon's own delay.
+function earconDue(now, armedAt, acked, fireMs, afterMs) {
+  return armedAt > 0 && acked && (now - armedAt) >= fireMs + afterMs;
+}
+
+// The earcon deliberately does NOT claim botSpeaking: pollReply must keep
+// accepting replies while it plays, and a landing reply (or ack of the next
+// turn) preempts it via stopEarcon() + the player handoff. The loop replays
+// the file until any exit condition trips; stopEarcon()'s player.stop()
+// settles the in-flight playResource so the cut is immediate, not
+// end-of-file.
+let earconActive = false;
+async function playEarconLoop() {
+  if (earconActive || !EARCON) return;
+  earconActive = true;
+  const armedAtStart = ackArmedAt;
+  const startedAt = Date.now();
+  log('[earcon] start');
+  try {
+    while (earconActive && connected && player && !botSpeaking
+           && !replyQueue.length && ackArmedAt === armedAtStart) {
+      if (Date.now() - startedAt >= EARCON.maxMs) {
+        // A reply that never comes must not hum forever. Disarm the turn too,
+        // or the due-check would restart the loop on the next poll tick.
+        log(`[earcon] gave up — no reply after ${Math.round(EARCON.maxMs / 1000)}s`);
+        ackArmedAt = 0;
+        break;
+      }
+      await playResource(fs.createReadStream(EARCON.file), EARCON.volume);
+    }
+  } catch (e) { log('[earcon] err', e.message);
+  } finally { earconActive = false; }
+}
+function stopEarcon() {
+  if (!earconActive) return;
+  earconActive = false;
+  try { if (player) player.stop(); } catch { /* */ }
+  log('[earcon] stop');
+}
+
 async function speak(text) {
   if (!connected || !player) { log('[tts] not in channel — dropping reply'); return; }
+  recordTurn('assistant', text);
   if (TTS_PIPE && text.length >= TTS_PIPE_MIN_CHARS) {
     const parts = splitSentences(text, TTS_PIPE_MAX_CHUNK);
     if (parts.length > 1) return speakPipelined(parts);
@@ -474,13 +1013,45 @@ async function speakPipelined(parts) {
     botSpeaking = false;
   }
 }
-function playResource(stream) {
+// Playback ducking (BARGE_CONFIRM) — currentRes tracks whatever is playing so
+// a duck lands mid-chunk, and a NEW resource inherits the duck (a phantom can
+// straddle a pipelined chunk boundary; the volume must not pop back between
+// chunks while a verdict is pending).
+let currentRes = null, ducked = false;
+const DUCK_FACTOR = 0.3;
+function duckPlayback() {
+  if (ducked || !currentRes || !currentRes.volume) return;
+  ducked = true;
+  try { currentRes.volume.setVolume((currentRes._base || 1) * DUCK_FACTOR); } catch { /* */ }
+  log('[barge] duck — confirming speech before interrupting');
+}
+function restorePlayback() {
+  if (!ducked) return;
+  ducked = false;
+  try { if (currentRes && currentRes.volume) currentRes.volume.setVolume(currentRes._base || 1); } catch { /* */ }
+  log('[barge] false alarm — volume restored');
+}
+function confirmBarge() {
+  const hadPlayback = botSpeaking || ducked;
+  ducked = false;
+  if (hadPlayback) {
+    log('[barge] confirmed — interrupting playback');
+    try { if (player) player.stop(true); } catch { /* */ }
+    botSpeaking = false;
+  }
+  if (replyQueue.length) { log(`[reply] dropped ${replyQueue.length} queued — user is speaking`); replyQueue = []; }
+}
+function playResource(stream, volume) {
   return new Promise((resolve) => {
-    const res = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+    const res = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
+    res._base = volume || 1;
+    try { if (res.volume) res.volume.setVolume(res._base * (ducked ? DUCK_FACTOR : 1)); } catch { /* */ }
+    currentRes = res;
     let settled = false;
     const done = () => {
       if (settled) return; settled = true;
       clearTimeout(safety); player.off('stateChange', onState); player.off('error', onErr);
+      if (currentRes === res) currentRes = null;
       resolve();
     };
     // Settle on ANY arrival at a terminal state — not just the playing->idle edge.
@@ -495,29 +1066,86 @@ function playResource(stream) {
   });
 }
 
+// A configured replyFile is a voice source on ANY transport: whatever writes
+// it becomes the voice (the file transport's documented contract, and in mcp
+// deployments the seam a router or ssh-brain-shuttle pull-loop speaks
+// through). Returns the raw text, or null when unconfigured/absent/unreadable.
+function readReplyFile() {
+  if (!T.replyFile) return null;
+  try {
+    if (!fs.existsSync(T.replyFile)) return null;
+    const raw = fs.readFileSync(T.replyFile, 'utf8');
+    fs.unlinkSync(T.replyFile);
+    return raw;
+  } catch (e) { log('[reply] file err', e.message); return null; }
+}
+
 function pollReply() {
   try {
     if (!botSpeaking) {
       if (!connected) {
-        // Not in the channel — nobody to hear a reply or an ack. Drain any queued
-        // reply so it can't go stale and surface on a later join, but don't synthesize.
+        // Not in the channel — nobody to hear a reply, a local ack, or a fixed
+        // ack. Drain anything queued so it can't go stale and surface on a
+        // later join, but don't synthesize.
         ackArmedAt = 0;
-        if (pendingReply) { log('[reply] dropped — not in channel'); pendingReply = null; }
-        if (T.type === 'file' && fs.existsSync(T.replyFile)) { try { fs.unlinkSync(T.replyFile); } catch {} log('[reply] dropped file — not in channel'); }
+        stopEarcon();
+        if (replyQueue.length) { log(`[reply] dropped ${replyQueue.length} queued — not in channel`); replyQueue = []; }
+        if (pendingAck) { try { fs.unlinkSync(pendingAck.wav); } catch {} log('[localAck] dropped — not in channel'); pendingAck = null; }
+        if (readReplyFile() !== null) log('[reply] dropped file — not in channel');
         setTimeout(pollReply, 300); return;
       }
-      if (pendingReply) { const t = cleanForTTS(pendingReply); pendingReply = null; ackArmedAt = 0; if (t) { speak(t).finally(() => setTimeout(pollReply, 200)); return; } }
-      if (T.type === 'file' && fs.existsSync(T.replyFile)) {
-        // The documented file-transport contract: whatever writes replyFile
-        // becomes the voice — including unsolicited/proactive lines (a
-        // long-running brain announcing something). The brain owns this file;
-        // if it doesn't want text voiced, it doesn't write it here.
-        const raw = fs.readFileSync(T.replyFile, 'utf8'); fs.unlinkSync(T.replyFile);
-        ackArmedAt = 0;
-        const t = cleanForTTS(raw); if (t) { speak(t).finally(() => setTimeout(pollReply, 200)); return; }
+      if (replyQueue.length) {
+        // One queue item per pass: playback serializes on botSpeaking, and
+        // draining here would re-batch what multi-speak deliberately split.
+        stopEarcon();   // instant cut — the real answer preempts the ambient loop
+        const t = cleanForTTS(replyQueue.shift()); ackArmedAt = 0;
+        // Two-clear: a real reply landing means any not-yet-played tier-1
+        // local ack is now stale (voicing "let me check that" AFTER the real
+        // answer already arrived would read as broken) — drop it same as the
+        // fixed-ack arm just above.
+        if (pendingAck) { try { fs.unlinkSync(pendingAck.wav); } catch {} pendingAck = null; }
+        if (t) { speak(t).finally(() => setTimeout(pollReply, 200)); return; }
       }
-      if (ackDue(Date.now(), ackArmedAt, ackedThisTurn, ACK_AFTER_MS)) {
+      if (pendingAck) {
+        if (ackedThisTurn) {
+          // One filler per turn: the canned tier already fired — a late local
+          // ack must not stack a second one behind it.
+          try { fs.unlinkSync(pendingAck.wav); } catch { /* */ } pendingAck = null;
+        } else if (ackDue(Date.now(), ackArmedAt, ackedThisTurn, ACK_FIRE_MS || ACK_AFTER_MS)) {
+          const ack = pendingAck; pendingAck = null; ackedThisTurn = true;
+          speakLocalAck(ack).finally(() => setTimeout(pollReply, 200)); return;
+        }
+        // Ready but not yet due: hold it — a fast reply may still make it moot.
+      }
+      {
+        // Whatever writes replyFile becomes the voice — including unsolicited
+        // lines (a router announcing a route change, a shuttle-pulled remote
+        // reply). The writer owns the file; if it doesn't want text voiced,
+        // it doesn't write it here. `speak`-tool replies (pendingReply, above)
+        // win a same-pass race, which is the right priority unrouted.
+        const raw = readReplyFile();
+        if (raw !== null) {
+          stopEarcon();
+          ackArmedAt = 0;
+          // Same two-clear as the pendingReply branch: a routed reply landing
+          // makes an unplayed local ack stale (and orphaned its wav before
+          // this was added — see the fire-gate redesign).
+          if (pendingAck) { try { fs.unlinkSync(pendingAck.wav); } catch { /* */ } pendingAck = null; }
+          const t = cleanForTTS(raw); if (t) { speak(t).finally(() => setTimeout(pollReply, 200)); return; }
+        }
+      }
+      // With LOCAL_ACK on, the canned tier shares the fire point and runs as
+      // the fallback: the pendingAck branch above is checked first in the same
+      // pass, so a ready content-aware ack always wins the moment.
+      if (ackDue(Date.now(), ackArmedAt, ackedThisTurn, ACK_FIRE_MS || ACK_AFTER_MS)) {
         ackedThisTurn = true; speakAck().finally(() => setTimeout(pollReply, 200)); return;
+      }
+      // Ack fired, reply still cooking — fill the silence with the ambient
+      // loop (fire-and-forget: the poller keeps ticking, and any reply branch
+      // above cuts it on its next pass).
+      if (EARCON && !earconActive
+          && earconDue(Date.now(), ackArmedAt, ackedThisTurn, ACK_FIRE_MS || ACK_AFTER_MS, EARCON.afterMs)) {
+        playEarconLoop();
       }
     }
   } catch (e) { log('[reply] err', e.message); }
@@ -577,7 +1205,7 @@ async function initMcp() {
   mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [{
       name: 'speak',
-      description: 'Speak a reply aloud in the Discord voice channel (text-to-speech). Use only to answer a voice-channel (spoken) turn.',
+      description: 'Speak a reply aloud in the Discord voice channel (text-to-speech). Use only to answer a voice-channel (spoken) turn. Calls queue and play in order, so for a long answer call speak with the first paragraph IMMEDIATELY and keep composing — speech starts while you write the rest. If the user speaks again before a queued part plays, it is dropped (they moved on).',
       inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'The reply text to voice.' } }, required: ['text'] },
     }],
   }));
@@ -653,20 +1281,28 @@ function onSpeakingStart(userId) {
   if (ALLOWED && userId !== ALLOWED) return;
   if (!conn || !connected) return;   // a speaking event landed during teardown/reconnect
   if (botSpeaking && BARGE_IN) {
-    // Barge-in: the user started talking while we were speaking. Stop playback
-    // immediately so they never have to wait for the bot to finish a reply.
-    log('[barge] user spoke during playback — interrupting');
-    try { player.stop(true); } catch {}
-    botSpeaking = false;
+    if (BARGE_CONFIRM) {
+      // Duck, don't die: keep playing quietly and capture in parallel —
+      // finalize()'s STT verdict either confirms (real interrupt) or
+      // restores the volume (phantom).
+      duckPlayback();
+    } else {
+      // Classic barge-in: the user started talking while we were speaking.
+      // Stop playback immediately.
+      log('[barge] user spoke during playback — interrupting');
+      try { player.stop(true); } catch {}
+      botSpeaking = false;
+    }
   }
-  if (botSpeaking || capturing) {
+  if (capturing) {
     // One turn at a time: speech during an active capture (incl. a command
     // brain still computing) is dropped by design — say so, or a slow brain
     // reads as "the bot ignored me" with nothing in the log.
-    if (capturing) log('[recv] busy — speech ignored (previous turn still processing)');
+    log('[recv] busy — speech ignored (previous turn still processing)');
     return;
   }
-  handleUtterance(userId, conn.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: END_SILENCE } }));
+  if (botSpeaking && !BARGE_CONFIRM) return;   // bot speaking, no barge-in configured — ignore
+  handleUtterance(userId, conn.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: endSilenceMs() } }));
 }
 
 // Join the voice channel (idempotent). Fires the presence-enter hook first so
@@ -680,6 +1316,15 @@ async function enterChannel(reason) {
     await io.connect();
     connected = true;
     log(`[loop] joined voice channel ${CHANNEL} (${reason})`);
+    if (enrollNeeded()) {
+      // First-run (or resumed) enrollment: greet once the join settles.
+      setTimeout(() => {
+        if (!connected || !enrollNeeded()) return;
+        const n = countEnrollSamples();
+        speak(n ? `Let us keep setting up your voiceprint. ${ENROLL_PROMPTS[Math.min(n - 1, ENROLL_PROMPTS.length - 1)]}` : ENROLL_INTRO)
+          .catch((e) => log('[enroll] intro err', e.message));
+      }, 1200);
+    }
   } catch (e) {
     // Stay alive on a failed join — in mcp mode this process is the session's
     // MCP server, so a transient voice hiccup must not take it (and the tool) down.
@@ -765,7 +1410,14 @@ client.on('error', (e) => log('[client] err', e.message));
 // Last-resort guards: in mcp mode this process IS the session's MCP server, so an
 // uncaught throw must not silently kill the `speak` tool. Log (to stderr in mcp
 // mode via log()) and keep running.
-process.on('uncaughtException', (e) => log('[fatal] uncaughtException', (e && e.stack) || e));
+process.on('uncaughtException', (e) => {
+  log('[fatal] uncaughtException', (e && e.stack) || e);
+  // Bound the blast radius: a crash mid-capture or mid-playback must not
+  // leave the loop deaf (capturing stuck) or mute (botSpeaking stuck) — the
+  // watchdog would eventually clear a capture, but a crash we SAW deserves an
+  // immediate reset.
+  capturing = false; botSpeaking = false;
+});
 process.on('unhandledRejection', (e) => log('[fatal] unhandledRejection', (e && e.stack) || e));
 
 // Graceful shutdown: tear down the voice connection and clear the presence
@@ -788,12 +1440,24 @@ function shutdown(sig) {
     setPresence(false);
     if (conn) conn.destroy();
     client.destroy();
+    // Release the singleton pidfile only if it's ours — a refused duplicate
+    // signaled mid-boot must not delete the real holder's claim.
+    try { if (fs.readFileSync(LOOP_PIDFILE, 'utf8').trim() === String(process.pid)) fs.unlinkSync(LOOP_PIDFILE); } catch { /* */ }
   } catch { /* */ } finally { process.exit(0); }
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 async function main() {
+  // Refuse duplicates before ANY side effect (onStart hooks, MCP handshake,
+  // gateway login) — a second instance must change nothing but the log.
+  const single = acquireSingleton(TMPDIR);
+  if (!single.ok) {
+    const msg = `duplicate instance refused — voice_loop pid ${single.holder} already owns ${TMPDIR}`;
+    log('[singleton]', msg);
+    console.error(`broca-machina: ${msg} (kill it, or point this instance at a different tmpDir)`);
+    process.exit(3);
+  }
   // ffmpeg is a hard dependency of the capture path (PCM -> 16k WAV for STT).
   // Probe once at boot: a clear error now beats every utterance silently
   // converting to nothing later.
@@ -830,8 +1494,36 @@ module.exports = {
   __test: {
     io, runHook, setPresence,
     enterChannel, leaveChannel, scheduleLeave, clearLeaveTimer, handleVoiceState,
-    splitSentences, ackDue, pickAckIndex, cleanForTTS,
-    state: () => ({ connected, connecting, hasLeaveTimer: !!leaveTimer, presenceActive }),
-    cfg: { AUTO_JOIN, IDLE_LEAVE_MS, VAD: !!VAD, TTS_PIPE: !!TTS_PIPE },
+    handleUtterance, setCapturingForTest: (v) => { capturing = v; },
+    splitSentences, ackDue, earconDue, pickAckIndex, cleanForTTS, truncateSpoken,
+    sendTranscript, readReplyFile, acquireSingleton, speak,
+    recordTurn, clearTurns: () => { recentTurns.length = 0; },
+    enrollNeeded, getTurns: () => recentTurns.slice(), endSilenceMs, vadMinSilenceMs,
+    looksIncomplete, hasWakeWord,
+    duckPlayback, restorePlayback, confirmBarge,
+    setResourceForTest: (r) => { currentRes = r; },
+    ack: { get: () => ackArmedAt, set: (v) => { ackArmedAt = v; } },
+    acked: { get: () => ackedThisTurn, set: (v) => { ackedThisTurn = v; } },
+    state: () => ({
+      connected, connecting, hasLeaveTimer: !!leaveTimer, presenceActive,
+      botSpeaking, capturing, hasPendingReply: replyQueue.length > 0, replyQueueLen: replyQueue.length,
+      hasPendingAck: !!pendingAck, earconActive, ducked,
+    }),
+    cfg: { AUTO_JOIN, IDLE_LEAVE_MS, VAD: !!VAD, TTS_PIPE: !!TTS_PIPE, LOCAL_ACK: !!LOCAL_ACK, ACK_FIRE_MS, EARCON: !!EARCON, BARGE_CONFIRM, MAX_CAPTURE_MS, SPEAKER_ENROLL: !!SPEAKER_ENROLL, SEMANTIC: !!SEMANTIC, ADDRESS_GATE: !!ADDRESS_GATE },
+    // TEST-ONLY seams for the local-ack sequencing selftest (never touched by
+    // any production code path). setPlayerForTest injects a fake AudioPlayer
+    // without a live Discord connection so pollReply()/playResource() run for
+    // real against it; enqueueReply/enqueueAckForTest drive the exact same
+    // pendingReply/pendingAck slots pollReply() itself reads, so the test
+    // exercises the real queueing/two-clear logic, not a reimplementation.
+    setPlayerForTest: (p) => { player = p; connected = true; },
+    enqueueReply,
+    enqueueAckForTest: (wav, text) => { pendingAck = { wav, text }; },
+    pollReply,
+    // Exposes the real dispatchLocalAck() (live Ollama HTTP call + real TTS
+    // synth) for an end-to-end latency/correctness probe, distinct from the
+    // enqueueAckForTest bypass the sequencing selftest uses.
+    dispatchLocalAck,
+    getPendingAck: () => pendingAck,
   },
 };

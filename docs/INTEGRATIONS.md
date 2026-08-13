@@ -86,6 +86,49 @@ another inbox and outbox.
 state across turns, or you want broca-machina and the brain to live on separate
 schedules.
 
+## Routing between multiple brains
+
+The `file` transport doesn't care who consumes `transcriptDir` and writes
+`replyFile` — which means the *brain* can be switched at runtime without
+touching broca-machina. The pattern (used by real deployments; ship your own
+variant):
+
+- **Route file** — your inbox consumer reads a small JSON file each tick,
+  e.g. `{"type":"pane","target":"other-session","name":"dive"}` for another
+  local tmux session, or
+  `{"type":"ssh","host":"your-brain-host","tmux":"main","say":"~/.voice/say","name":"remote"}`
+  for a brain on another machine. File absent → your default brain. Malformed
+  → treat as absent (never wedge the channel on bad JSON).
+- **Control phrases** — check each transcript against a small normalized
+  phrase set *before* delivering it ("go back to ...", "connect me to ...").
+  Handling these in the router means the speaker can always escape, even if
+  the routed brain hangs.
+- **Remote brains** — `scripts/ssh-brain-shuttle.sh` carries both streams
+  over SSH to a brain in a tmux session on another host: `deliver <file>`
+  pastes a transcript into the remote pane; `pull-loop` moves the remote
+  reply file into your local `replyFile` atomically. Configure via
+  `SHUTTLE_HOST/SHUTTLE_TMUX/SHUTTLE_REMOTE_SAY/SHUTTLE_LOCAL_REPLY` (see the
+  script header; `ensure-pull`/`stop`/`status` manage the loop). Brains
+  behind a bastion: point the ssh alias at a `ProxyJump` entry in
+  `~/.ssh/config`. Use `ControlMaster` for ~tens-of-ms operations.
+- **Handback** — a routed brain returns the channel by replying with exactly
+  `<<HANDBACK>>` (configurable `SHUTTLE_SENTINEL`); the shuttle runs
+  `SHUTTLE_ON_HANDBACK` instead of speaking it.
+- **MCP deployments** — the `mcp` transport joins the same pattern via three
+  optional keys: `transport.transcriptDir` tees every utterance to a file for
+  your router; `transport.gateFile` (point it at your route file) suppresses
+  the MCP channel notification while it exists, so an active route makes the
+  default brain structurally deaf; `transport.replyFile` is polled as an
+  additional voice source — your router or the shuttle's `pull-loop` writes
+  replies there. One deployment can converse over MCP by default and hand the
+  channel to another brain at runtime.
+
+**Security:** the route file and your routes registry are trusted local
+input — whoever holds the mic inherits the routed brain's privileges.
+`allowedUserId` still gates whose speech is transcribed, and transcripts
+remain untrusted text (see the prompt-injection note in the config example).
+See `examples/file-transport/remote-brain.md` for a walkthrough.
+
 ### 3. `mcp` — the loop becomes an MCP server
 
 For an **agent host that speaks MCP** (e.g. Claude Code), broca-machina can run
