@@ -56,15 +56,71 @@ def transcribe(model, wav_path):
             if s < speaker.threshold():
                 print(f"[speaker] rejected (score {s:.2f})", file=sys.stderr)
                 return ""
+            # Accepted scores log too: threshold tuning needs the full
+            # distribution, not just the tail that fell below the line.
+            print(f"[speaker] ok (score {s:.2f})", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001 — any gate fault means "allow"
             print(f"[speaker] gate error — allowing: {exc}", file=sys.stderr)
-    kwargs = {"language": "en", "vad_filter": True}
+    # WHISPER_VAD_FILTER=0 disables Whisper's internal energy-based VAD. With a
+    # speaker gate deciding who reaches Whisper, the internal VAD is redundant —
+    # and harmful: quiet speech passes the (volume-normalized) speaker gate but
+    # gets stripped to "" here. Default stays on for gateless deployments.
+    vad = os.environ.get("WHISPER_VAD_FILTER", "1").strip() != "0"
+    kwargs = {"language": "en", "vad_filter": vad}
     prompt = os.environ.get("WHISPER_INITIAL_PROMPT", "").strip()
     if prompt:
         kwargs["initial_prompt"] = prompt
     segments, _ = model.transcribe(wav_path, **kwargs)
-    text = " ".join(s.text for s in segments).strip()
+    segs = list(segments)
+    if segs:
+        # Per-utterance confidence stats: with vad_filter off, hallucination
+        # filtering is threshold work, and thresholds need the live
+        # distribution — same reason accepted speaker scores log above.
+        ns_max = max(getattr(s, "no_speech_prob", 0.0) or 0.0 for s in segs)
+        lp_min = min(getattr(s, "avg_logprob", 0.0) or 0.0 for s in segs)
+        print(
+            f"[whisper] segs={len(segs)} no_speech_max={ns_max:.2f} logprob_min={lp_min:.2f}",
+            file=sys.stderr,
+        )
+    cap = os.environ.get("WHISPER_NO_SPEECH_MAX", "").strip()
+    if cap:
+        # WHISPER_NO_SPEECH_MAX=<float> drops segments the model itself rates
+        # likely-non-speech. Whisper's built-in skip needs BOTH high
+        # no_speech_prob AND low avg_logprob — stock-phrase hallucinations
+        # ("I don't know.") decode confidently, so the pair never fires.
+        try:
+            cap_f = float(cap)
+            kept = [s for s in segs if (getattr(s, "no_speech_prob", 0.0) or 0.0) <= cap_f]
+            if len(kept) < len(segs):
+                print(
+                    f"[whisper] dropped {len(segs) - len(kept)} segment(s) over no_speech cap {cap_f}",
+                    file=sys.stderr,
+                )
+            segs = kept
+        except ValueError:
+            pass
+    text = " ".join(s.text for s in segs).strip()
+    repeated = _repeated_sentence(text)
+    if repeated:
+        # The same sentence >=3 times in one utterance is Whisper's
+        # noise-loop signature (seen live: "Thank you. I. Thank you. Thank
+        # you." from a 13.7s silence blob) — never how people talk.
+        print(f'[whisper] hallucination — repeated sentence: "{repeated}"', file=sys.stderr)
+        return ""
     return _apply_fixups(text)
+
+
+def _repeated_sentence(text):
+    """Return the sentence repeated >=3 times in text (normalized), else None."""
+    counts = {}
+    for raw in re.split(r"[.!?]+", text):
+        norm = " ".join(re.sub(r"[^a-z0-9 ]", "", raw.lower()).split())
+        if not norm:
+            continue
+        counts[norm] = counts.get(norm, 0) + 1
+        if counts[norm] >= 3:
+            return norm
+    return None
 
 
 def _apply_fixups(text):

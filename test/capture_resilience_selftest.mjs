@@ -74,6 +74,38 @@ async function run() {
   check('phantom: acked flag restored', T.acked.get() === true);
   check('phantom: pending content-ack survives', T.getPendingAck() !== null);
 
+  // --- (2c) authoritative cancel during capture is NOT resurrected -----------
+  // Observed live 2026-08-13 23:18Z: an aside verdict landed (ackArmedAt=0,
+  // "no reply is coming") while a phantom capture was open; the phantom's
+  // restore blindly re-applied the pre-capture arm, resurrecting a dead turn —
+  // a filler fired and the earcon hummed for a reply that could never come.
+  // Restores must yield to any authoritative disarm that happened mid-capture.
+  check('exports cancelAck (authoritative disarm)', typeof T.cancelAck === 'function');
+  if (typeof T.cancelAck === 'function') {
+    fs.writeFileSync(sttOut, '');                  // phantom verdict
+    T.ack.set(888111); T.acked.set(false);
+    pt = new PassThrough();
+    T.handleUtterance('U1', pt);
+    T.cancelAck();                                 // aside/reply landed mid-capture
+    feedSilence(pt);
+    await delay(150); pt.end();
+    await delay(1000);
+    check('cancel-race: phantom does not resurrect cancelled ack', T.ack.get() === 0);
+
+    fs.writeFileSync(sttOut, '');
+    T.ack.set(888222); T.acked.set(false);
+    pt = new PassThrough();
+    T.handleUtterance('U1', pt);
+    T.cancelAck();
+    feedSilence(pt, 5);                            // 0.1s -> too-short path
+    await delay(150); pt.end();
+    await delay(1000);
+    check('cancel-race: too-short does not resurrect cancelled ack', T.ack.get() === 0);
+  } else {
+    check('cancel-race: phantom does not resurrect cancelled ack', false);
+    check('cancel-race: too-short does not resurrect cancelled ack', false);
+  }
+
   // --- (2b) confirmed speech: resets commit, transcript delivered ------------
   fs.writeFileSync(sttOut, 'hello there friend');
   T.ack.set(777222); T.acked.set(true);

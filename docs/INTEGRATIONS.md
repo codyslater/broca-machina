@@ -236,7 +236,12 @@ These are set in `config.json` and are independent of the transport:
   directory). **`tts.speedFile`** — a file holding a float; playback speed,
   pitch preserved.
 - **`stt.env`** — extra environment for the STT process (model, device, compute
-  type — see `src/stt.py`).
+  type — see `src/stt.py`). Hallucination knobs there: `WHISPER_VAD_FILTER=0`
+  turns Whisper's internal energy VAD off (redundant, and harmful to quiet
+  speech, once a speaker gate decides who reaches Whisper);
+  `WHISPER_NO_SPEECH_MAX=<float>` drops segments the model itself rates
+  likely-non-speech; a sentence repeated three or more times in one utterance
+  is always dropped as Whisper's noise-loop signature.
 - **`playWavFile`** — write a path to a `.wav` here and broca-machina plays it
   into the channel. Handy for a pre-rendered greeting or a cloned-voice clip,
   independent of the text path.

@@ -77,6 +77,20 @@ async function run() {
   check('wake: absent', T.hasWakeWord('please give me the status') === false);
   check('wake: substring does not count', T.hasWakeWord('the echoes were loud') === false);
 
+  // FUZZY WAKE WORD (2026-08-29). STT mangles a short name every session; a
+  // missed wake word routes a directly-addressed turn to the judge, which is
+  // where it dies. Live loss: a directly-addressed "hey <mangled name>, give me an update".
+  check('fuzzy: one-edit substitution', T.hasWakeWord('ecko give me the status') === true);
+  check('fuzzy: one-edit deletion', T.hasWakeWord('eco give me the status') === true);
+  check('fuzzy: two edits do NOT match', T.hasWakeWord('the eckoo was loud') === false);
+  check('fuzzy: helper is symmetric on one edit', T.withinOneEdit('junk', 'juno') === true
+        && T.withinOneEdit('jun', 'juno') === true && T.withinOneEdit('junos', 'juno') === true);
+  check('fuzzy: helper rejects two edits', T.withinOneEdit('echoes', 'echo') === false);
+  // The stoplist is what keeps fuzziness from disabling the gate outright:
+  // a 4-letter wake word is one edit from `that`, which appears in half of all speech.
+  check('fuzzy: common words are stoplisted', T.wakeStopwords.has('that')
+        && T.wakeStopwords.has('than') && T.wakeStopwords.has('the'));
+
   T.setPlayerForTest({ play: () => {}, on: () => {}, off: () => {}, stop: () => {} });
 
   // wake word -> delivered instantly, judge never consulted
@@ -102,13 +116,64 @@ async function run() {
   check('aside: teed for the record', asides() === 1);
   check('aside: ack disarmed', T.ack.get() === 0);
 
+  // hot window: speech landing shortly after the assistant finished talking is
+  // a reply to it — delivered WITHOUT consulting the judge, even when the
+  // judge would have said ASIDE. (Observed live 2026-08-13..16: four "Yeah, …"
+  // replies to the assistant judged ASIDE and dropped.)
+  check('exports setBotSpeechEndedForTest', typeof T.setBotSpeechEndedForTest === 'function');
+  if (typeof T.setBotSpeechEndedForTest === 'function') {
+    verdict = 'ASIDE';
+    const callsBefore = judgeCalls.length;
+    T.setBotSpeechEndedForTest(Date.now());
+    await utter('yeah go ahead and make it live.');
+    check('hot window: delivered despite ASIDE verdict', delivered() === 3);
+    check('hot window: judge not consulted', judgeCalls.length === callsBefore);
+    T.setBotSpeechEndedForTest(0);   // cold again for the sections below
+  } else {
+    check('hot window: delivered despite ASIDE verdict', false);
+    check('hot window: judge not consulted', false);
+  }
+
+  // HOT WHILE WORKING (2026-08-29). A wall-clock window is measured from the
+  // assistant's last WORD, so a long silent tool run makes the channel read
+  // cold while the exchange is plainly still open. `ackArmedAt > 0` means a
+  // turn was sent and no reply has landed — the user waiting through that is
+  // in the same conversation, whatever the clock says.
+  check('exports channelIsHot', typeof T.channelIsHot === 'function');
+  {
+    verdict = 'ASIDE';
+    const callsBefore = judgeCalls.length;
+    const deliveredBefore = delivered();
+    T.setBotSpeechEndedForTest(Date.now() - 3600000);   // last spoke an hour ago
+    check('hot: clock alone reads COLD', T.channelIsHot() === false);
+    T.ack.set(Date.now());                              // ...but a reply is owed
+    check('hot: an owed reply reads HOT', T.channelIsHot() === true);
+    await utter('yeah go ahead and discard those.');
+    check('hot: owed reply delivers despite ASIDE verdict', delivered() === deliveredBefore + 1);
+    check('hot: owed reply skips the judge', judgeCalls.length === callsBefore);
+    // The latch must not outlive its reply: markBotSpoke() clears it wherever the
+    // assistant finishes speaking, so a settled channel goes cold again on its own.
+    T.ack.set(0);
+    T.setReplyOwedForTest(0);
+    T.setBotSpeechEndedForTest(0);
+    check('hot: cold again once the reply is settled', T.channelIsHot() === false);
+  }
+
+  // judge prompt explicitly marks continuations/agreements as ADDRESSED
+  check('judge: prompt marks continuations as ADDRESSED', judgeCalls[0].messages[0].content.includes('continuation'));
+  // ...and first-person task narration ("I'm going to go ahead and sack one
+  // zero zero three" — live FP 2026-08-16 21:26, dropped a lab-record turn).
+  check('judge: prompt marks first-person narration as ADDRESSED', judgeCalls[0].messages[0].content.includes('narrat'));
+
   // judge failure fails OPEN — connection refused and http-500 both deliver
   judgeMode = 'throw';
+  let before = delivered();
   await utter('what about the second checkpoint file?');
-  check('fail-open: connection error delivers', delivered() === 3);
+  check('fail-open: connection error delivers', delivered() === before + 1);
   judgeMode = 'http-error';
+  before = delivered();
   await utter('did the export finish overnight?');
-  check('fail-open: http error delivers', delivered() === 4);
+  check('fail-open: http error delivers', delivered() === before + 1);
 
   console.log(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`);
   process.exit(failed === 0 ? 0 : 1);

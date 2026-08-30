@@ -84,6 +84,26 @@ async function run() {
   T.confirmBarge();
   check('confirm idle: no stray player.stop', stops.length === stopsBefore);
 
+  // bargeWorthy — an interrupt needs a transcript that EARNS it. Whisper
+  // hallucinates short stock phrases on ducked noise blobs ("I don't know."
+  // killed playback 3x live 2026-08-16); confidence can't separate them
+  // (measured inside the real-speech band), so the bar is behavioral: >=
+  // bargeMinWords words, a wake word, or an explicit stop phrase. Shorter
+  // transcripts still DELIVER — they just can't kill audio.
+  check('exports bargeWorthy', typeof T.bargeWorthy === 'function');
+  if (typeof T.bargeWorthy === 'function') {
+    check('worthy: hallucination-length phrase is not', T.bargeWorthy("I don't know.") === false);
+    check('worthy: single word is not', T.bargeWorthy('Yeah.') === false);
+    check('worthy: explicit stop phrase is', T.bargeWorthy('Stop.') === true);
+    check('worthy: hold on is', T.bargeWorthy('Hold on.') === true);
+    check('worthy: never mind is', T.bargeWorthy('Never mind.') === true);
+    check('worthy: 4+ words are', T.bargeWorthy('please stop reading that back.') === true);
+  } else {
+    for (const n of ['worthy: hallucination-length phrase is not', 'worthy: single word is not',
+      'worthy: explicit stop phrase is', 'worthy: hold on is', 'worthy: never mind is',
+      'worthy: 4+ words are']) check(n, false);
+  }
+
   console.log(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`);
   process.exit(failed === 0 ? 0 : 1);
 }

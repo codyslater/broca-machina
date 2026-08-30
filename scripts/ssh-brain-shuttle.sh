@@ -51,6 +51,16 @@
 #   SHUTTLE_SSH_OPTS     extra ssh options      (optional)
 #   SHUTTLE_PERSISTENT   1 (default) = channel mode; 0 = pure v1 one-shot ops
 #   SHUTTLE_DELIVER_TIMEOUT_S  channel ACK wait before one-shot fallback
+#   SHUTTLE_LOCAL_MOUNT  local path mapping to the remote $HOME (e.g. an sshfs
+#                        mount); when set, the FALLBACK path's reply-claim and
+#                        purge-say run as file ops on it instead of a remote
+#                        shell (delivery always stays ssh — a mount is not a
+#                        shell). Unset = ssh exactly as before.
+#   SHUTTLE_MOUNT_TIMEOUT_S  bound on every mount probe (default 2); a hung
+#                        sshfs means "use ssh", never "no reply waiting"
+#   SHUTTLE_SSH_NO_MUX   1 = no ControlMaster multiplexing on the fallback ssh
+#   SHUTTLE_SSH_CONTROL_DIR   ControlPath dir (default ~/.ssh/cm)
+#   SHUTTLE_SSH_CONTROL_PERSIST  ControlPersist (default 10m)
 #                        (default 8)
 #
 # Remote requirements: GNU coreutils base64 (any Linux box; v1 had no such
@@ -85,9 +95,46 @@ DELIVER_LOCK="$STATE_DIR/deliver.lock"
 die()  { echo "ssh-brain-shuttle: $*" >&2; exit 2; }
 need() { [ -n "${!1:-}" ] || die "env $1 is required"; }
 
+# Connection multiplexing for the FALLBACK ssh path only -- and being precise about that
+# matters, because the obvious reading of this file is wrong.
+#
+# In normal operation neither direction opens an ssh per turn: cmd_deliver prefers
+# _deliver_channel, which writes "D <seq> <b64>" into the ONE long-lived ssh the pull-loop
+# holds open, and that same ssh runs the remote 0.5s watcher that ships replies back as
+# "R <base64>". One connection, both directions, ACKed. `_ssh` below is what runs when
+# that channel is down or refuses -- _deliver_oneshot, purge-say, the teardown notice.
+#
+# Measured 20260829 against the remote host, so the numbers are on the record: cold `ssh <host> true`
+# 2.0s; multiplexed 1.4-1.7s. The handshake is NOT the dominant cost -- remote shell
+# startup on a GPFS home is, and multiplexing cannot touch that. For contrast, reading a
+# just-created file over the sshfs mount was 0.16s and removing it 0.01s, with the delete
+# propagating correctly. So if the fallback path ever needs to be fast, the lever is the
+# mount, not this.
+#
+# ControlMaster=auto: first call opens the master, the rest ride it. ControlPath uses %C
+# (a hash of host/port/user) because a unix socket path is capped near 104 chars and a
+# literal %h on a long FQDN can blow past it. ControlPersist keeps the master alive
+# between turns, which is the entire point -- a per-call master would re-handshake.
+#
+# The socket is also STICKY, which is a feature here: some clusters round-robin their
+# login nodes, and the tmux server lives on exactly one of them, so a fresh connection
+# can land on the wrong host. Pinning to the node we first reached is what we want.
+#
+# ConnectTimeout still applies when the master is gone (VPN drop, node reboot), so a dead
+# socket fails in ~5s rather than hanging. Set SHUTTLE_SSH_NO_MUX=1 to opt out entirely.
+_mux_opts() {
+  [ -n "${SHUTTLE_SSH_NO_MUX:-}" ] && return 0
+  local d="${SHUTTLE_SSH_CONTROL_DIR:-$HOME/.ssh/cm}"
+  mkdir -p "$d" 2>/dev/null || return 0      # no control dir -> plain ssh, never a hard fail
+  chmod 700 "$d" 2>/dev/null || true
+  printf -- '-o ControlMaster=auto -o ControlPath=%s/%%C -o ControlPersist=%s' \
+    "$d" "${SHUTTLE_SSH_CONTROL_PERSIST:-10m}"
+}
+
 _ssh() {
   # shellcheck disable=SC2086
-  ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 ${SHUTTLE_SSH_OPTS:-} "$SHUTTLE_HOST" "$@"
+  ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+      $(_mux_opts) ${SHUTTLE_SSH_OPTS:-} "$SHUTTLE_HOST" "$@"
 }
 
 # Leading ~ can't expand locally for a remote path; hand it to the remote shell
@@ -221,15 +268,69 @@ EOF
 }
 
 # v1 fallback pull loop — one ssh exec per poll. Kept for SHUTTLE_PERSISTENT=0
+# --- mounted-filesystem fast path (fallback route only) ------------------------
+# The FALLBACK path's cost is not the ssh handshake, it is remote shell startup on a
+# GPFS home. Measured 20260829 against the remote host: `ssh true` 2.0s cold / 1.4-1.7s multiplexed,
+# versus 0.16s to read a just-created file over the sshfs mount and 0.01s to remove it,
+# with the delete propagating correctly. So when the same filesystem is mounted locally,
+# do the reply-claim and the purge as plain file operations and skip the remote shell.
+#
+# DELIVERY is deliberately NOT converted: pasting into a tmux pane is remote EXECUTION,
+# and a mount gives a filesystem, not a shell. Only the file-shaped operations move.
+#
+# SHUTTLE_LOCAL_MOUNT = local path that maps to the remote $HOME (e.g. /mnt/remote-home).
+# Unset -> every call below returns empty and the ssh path runs exactly as before.
+_mount_say() {   # -> local path for SHUTTLE_REMOTE_SAY, or empty
+  [ -n "${SHUTTLE_LOCAL_MOUNT:-}" ] || return 0
+  local rel="${SHUTTLE_REMOTE_SAY}"
+  case "$rel" in
+    '~/'*)      rel="${rel#\~/}" ;;
+    '$HOME/'*)  rel="${rel#\$HOME/}" ;;
+    /*)         return 0 ;;   # an absolute remote path we cannot map onto the mount root
+    *)          : ;;
+  esac
+  printf '%s/%s' "${SHUTTLE_LOCAL_MOUNT%/}" "$rel"
+}
+
+# A hung sshfs blocks forever, which is strictly worse than ssh's 5s ConnectTimeout —
+# so every probe is bounded and a timeout means "use ssh", never "no reply waiting".
+_mount_ok() {
+  [ -n "${SHUTTLE_LOCAL_MOUNT:-}" ] || return 1
+  timeout "${SHUTTLE_MOUNT_TIMEOUT_S:-2}" test -d "${SHUTTLE_LOCAL_MOUNT}/." 2>/dev/null
+}
+
+# Same claim idiom as the remote watcher: rename first so a concurrent writer cannot
+# append into the file we are reading, then read, then drop.
+_claim_via_mount() {   # echoes claimed text, empty when nothing waiting; rc 1 = unusable
+  local say; say="$(_mount_say)"
+  [ -n "$say" ] || return 1
+  _mount_ok || return 1
+  local t=""
+  if [ -s "$say.claim" ]; then
+    t="$(timeout "${SHUTTLE_MOUNT_TIMEOUT_S:-2}" cat "$say.claim" 2>/dev/null)" || return 1
+    rm -f "$say.claim" 2>/dev/null
+  elif [ -s "$say" ]; then
+    timeout "${SHUTTLE_MOUNT_TIMEOUT_S:-2}" mv "$say" "$say.claim" 2>/dev/null || return 1
+    t="$(timeout "${SHUTTLE_MOUNT_TIMEOUT_S:-2}" cat "$say.claim" 2>/dev/null)" || return 1
+    rm -f "$say.claim" 2>/dev/null
+  fi
+  printf '%s' "$t"
+}
+
 # and as the documented reference for the claim idiom the channel script uses.
 _pull_loop_oneshot() {
   local say text
   say="$(_remote_path "$SHUTTLE_REMOTE_SAY")"
-  text=$(_ssh "if [ -s \"$say.claim\" ]; then cat \"$say.claim\" && rm -f \"$say.claim\"; fi" 2>/dev/null) || text=""
+  # Recover a stranded .claim from a previous run, then poll. Each pass prefers the
+  # mount and falls back to ssh, re-checked EVERY pass rather than latched once: a mount
+  # can go stale mid-session, and latching would strand the loop on a dead path.
+  text="$(_claim_via_mount)" || \
+    text=$(_ssh "if [ -s \"$say.claim\" ]; then cat \"$say.claim\" && rm -f \"$say.claim\"; fi" 2>/dev/null) || text=""
   [ -n "$text" ] && _deliver_text "$text"
   while :; do
-    text=$(_ssh "if [ -s \"$say\" ]; then mv \"$say\" \"$say.claim\" \
-                 && cat \"$say.claim\" && rm -f \"$say.claim\"; fi" 2>/dev/null) || text=""
+    text="$(_claim_via_mount)" || \
+      text=$(_ssh "if [ -s \"$say\" ]; then mv \"$say\" \"$say.claim\" \
+                   && cat \"$say.claim\" && rm -f \"$say.claim\"; fi" 2>/dev/null) || text=""
     [ -n "$text" ] && _deliver_text "$text"
     sleep "$POLL_S"
   done
@@ -366,6 +467,10 @@ cmd_purge_say() {
   # a new pull-loop for the host.
   need SHUTTLE_HOST; need SHUTTLE_REMOTE_SAY
   local rsay; rsay="$(_remote_path "$SHUTTLE_REMOTE_SAY")"
+  local msay; msay="$(_mount_say)"
+  if [ -n "$msay" ] && _mount_ok; then
+    timeout "${SHUTTLE_MOUNT_TIMEOUT_S:-2}" rm -f -- "$msay" "$msay.claim" 2>/dev/null && return 0
+  fi
   # Quotes survive to the remote shell (same idiom as the channel script): a
   # say path with a space or glob char must neither word-split nor expand.
   _ssh "rm -f -- \"$rsay\" \"$rsay.claim\""

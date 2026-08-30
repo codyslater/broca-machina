@@ -93,6 +93,31 @@ async function run() {
   await delay(400);
   check('cap: stays off', T.state().earconActive === false);
 
+  // longWaitDue — pure predicate for the spoken "still working" notice on
+  // long agent-brain waits (fires once per turn, between the earcon's start
+  // and its give-up). firedFor is the armedAt value it last fired for.
+  check('exports longWaitDue', typeof T.longWaitDue === 'function');
+  if (typeof T.longWaitDue === 'function') {
+    check('longwait: due after window', T.longWaitDue(2000, 1000, 0, 1000) === true);
+    check('longwait: not before window', T.longWaitDue(1500, 1000, 0, 1000) === false);
+    check('longwait: fires once per turn', T.longWaitDue(2500, 1000, 1000, 1000) === false);
+    check('longwait: never when unarmed', T.longWaitDue(2000, 0, 0, 1000) === false);
+    check('longwait: disabled at afterMs 0', T.longWaitDue(2000, 1000, 0, 0) === false);
+  }
+  // renderLongWaitPhrase — {who} templating so the notice can name the session
+  // actually being waited on (CS, live 2026-08-30: the fixed line named the
+  // default brain while the wait was on a routed remote session).
+  check('exports renderLongWaitPhrase', typeof T.renderLongWaitPhrase === 'function');
+  if (typeof T.renderLongWaitPhrase === 'function') {
+    check('longwait: {who} substituted', T.renderLongWaitPhrase('Still waiting on {who}.', 'the remote session') === 'Still waiting on the remote session.');
+    check('longwait: every {who} substituted', T.renderLongWaitPhrase('{who}? {who}!', 'x') === 'x? x!');
+    check('longwait: no placeholder unchanged', T.renderLongWaitPhrase('Still working.', 'x') === 'Still working.');
+  } else {
+    for (const n of ['longwait: due after window', 'longwait: not before window',
+      'longwait: fires once per turn', 'longwait: never when unarmed',
+      'longwait: disabled at afterMs 0']) check(n, false);
+  }
+
   console.log(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`);
   process.exit(failed === 0 ? 0 : 1);
 }

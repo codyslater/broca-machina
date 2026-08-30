@@ -69,6 +69,14 @@ async function run() {
   check('heuristic: question always complete', inc('what is this for?') === false);
   check('heuristic: short answer complete', inc('yes') === false);
   check('heuristic: empty is not held', inc('') === false);
+  // Observed live 2026-08-16: "Tell me what we're working on." held 4s because
+  // "on" sat in the connective list. Prepositions are SOFT — English sentences
+  // end on them constantly, so Whisper's own terminal period marks a real end;
+  // hard connectives ("and.", "the.") stay held even with a period.
+  check('heuristic: preposition-final sentence with period complete', inc("Tell me what we're working on.") === false);
+  check('heuristic: preposition-final command with period complete', inc('Turn it on.') === false);
+  check('heuristic: dangling preposition without period still held', inc('tell me what we are working on') === true);
+  check('heuristic: hard connective with period still held', inc('I went there and.') === true);
 
   T.setPlayerForTest({ play: () => {}, on: () => {}, off: () => {}, stop: () => {} });
 

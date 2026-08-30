@@ -140,6 +140,12 @@ Start from `config.example.json`. Every field the loop reads is listed below; fi
 | `minUtteranceSec` | number | `0.4` | Utterances shorter than this are discarded before STT. *optional* |
 | `maxReplyChars` | number | `700` | Reply text is truncated to this many characters before TTS. *optional* |
 | `bargeIn` | boolean | `true` | When `true`, the user speaking during a reply **interrupts** playback immediately (barge-in). *optional* |
+| `bargeInConfirm` | boolean | `true` | Confirm-before-kill barge-in: a speaking-start **ducks** playback and STT decides — real speech interrupts, a noise blob restores the volume. `false` = classic instant interrupt. *optional* |
+| `bargeMinWords` | number | `4` | Confirm mode: a transcript only cuts playback if it has at least this many words, contains a wake word, or is a stop phrase (`stop`, `wait`, `hold on`…). Shorter turns still deliver. `0` disables the bar. *optional* |
+| `duckFactor` | number | `0.3` | Playback volume while a speaking-start is being confirmed. Raise toward `0.55` in a noisy room where false ducks are common. *optional* |
+| `duckAfterMs` | number | `350` | Speech must persist this long before the duck lands, so a door or mic bump never dims a reply. `0` = duck on the speaking-start edge. *optional* |
+| `voiceFallback.channelId` | string \| null | `null` | Discord **text** channel that receives a reply when nobody is in the voice channel (bot not joined, or the allowed user left) instead of dropping it. Must be postable by the *voice* bot's token. *optional* |
+| `voiceFallback.speakerRouteFiles` | string[] | `[]` | JSON files (keys `name`/`rc_name`/`tmux`) naming the session voice is routed to; the fallback banner credits it. Read at post time, first readable wins. *optional* |
 | `cmdTimeoutMs` | number | `60000` | Hard cap on any STT/TTS/brain/ffmpeg subprocess; a hung child is killed and treated as empty output, so a wedged model or server can't strand the loop. *optional* |
 | `playTimeoutMs` | number | `60000` | Safety cap on a single playback settling, so a stuck player can never wedge the loop into a deaf+mute state. *optional* |
 | `ackAfterMs` | number | `0` | Fast acknowledgement. If > 0, speak an ack phrase this many ms **after you stop talking** when the brain's real reply hasn't landed yet — a quick "still thinking" filler that overlaps STT + brain time so a slow (LLM/agent) brain doesn't leave the channel silent. A fast reply preempts it (no double-talk). Works for every transport. `0` disables. *optional* |
