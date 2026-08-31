@@ -655,6 +655,16 @@ function cleanForTTS(t) {
 // "is the human actually here" without polling Discord.
 function setPresence(present) {
   presenceActive = present;
+  if (present) {
+    presenceSince = Date.now(); presenceUtterances = 0; presenceEdges = 0;
+  } else if (presenceSince) {
+    const secs = Math.round((Date.now() - presenceSince) / 1000);
+    const deaf = secs >= DEAF_MIN_SEC && presenceEdges === 0;
+    log(`[session] user present ${secs}s — ${presenceEdges} speaking edge(s), `
+      + `${presenceUtterances} utterance(s) received`
+      + (deaf ? '  ** DEAF — Discord delivered no speaking events; restart the loop **' : ''));
+    presenceSince = 0;
+  }
   if (!PRESENCE_FILE) return;
   try {
     if (present) fs.writeFileSync(PRESENCE_FILE, String(Date.now()));
@@ -684,6 +694,28 @@ let connected = false;      // true once joined + player wired
 let connecting = false;     // guards against overlapping enterChannel() calls
 let leaveTimer = null;      // pending idle-leave timer (armed when the user leaves)
 let presenceActive = false; // is the allowed user currently in the channel
+// Deaf-loop instrumentation (20260831). A wedged loop joins cleanly, reports
+// Ready, and receives NOTHING with no error logged — and the log cannot tell
+// that apart from "the user was in the channel but never spoke", because both
+// look like zero [recv] lines. These three counters make the distinction
+// explicit: `presenceEdges` counts what DISCORD delivered, `presenceUtterances`
+// counts what we finished capturing. Edges 0 while the user sat there for a
+// while = Discord never told us they spoke, which is the actual failure.
+const DEAF_MIN_SEC = 45;    // below this, "no edges" is just a short quiet visit
+let presenceSince = 0;      // ms ts the allowed user entered the channel (0 = absent)
+let presenceUtterances = 0; // utterances fully captured since they entered
+let presenceEdges = 0;      // speaking.start edges Discord delivered since they entered
+const gateDropLast = {};    // reason -> last-logged ms, throttles the gate-drop lines
+
+// A speaking edge we deliberately ignored. Throttled per reason: in a healthy
+// session these fire constantly and would drown the log; what matters is that
+// the reason appears AT ALL, so once every 30s per reason is enough to name it.
+function gateDrop(reason) {
+  const now = Date.now();
+  if (now - (gateDropLast[reason] || 0) < 30000) return;
+  gateDropLast[reason] = now;
+  log(`[recv] edge dropped — ${reason}`);
+}
 
 function handleUtterance(userId, opus) {
   capturing = true;
@@ -764,6 +796,7 @@ function handleUtterance(userId, opus) {
       if ((ACK_AFTER_MS || LOCAL_ACK) && !capturing) { ackArmedAt = Date.now(); ackedThisTurn = false; }
       const wav = path.join(TMPDIR, `utt_${utcTs()}.wav`);
       await pcmToWav(pcm, wav);
+      presenceUtterances++;
       log(`[recv] ${secs.toFixed(1)}s -> STT (${reason})`);
       const text = (await runCmd([...STT_CMD, wav], (CFG.stt && CFG.stt.env) || {})).trim();
       // Enrollment collects the AUDIO of utterances that pass the same
@@ -1573,8 +1606,9 @@ function realDisconnect() {
 const io = { connect: realConnect, disconnect: realDisconnect };
 
 function onSpeakingStart(userId) {
-  if (ALLOWED && userId !== ALLOWED) return;
-  if (!conn || !connected) return;   // a speaking event landed during teardown/reconnect
+  if (ALLOWED && userId !== ALLOWED) return gateDrop('speaker is not the allowed user');
+  presenceEdges++;                   // Discord DID tell us they spoke — count before any gate
+  if (!conn || !connected) return gateDrop('no live connection (teardown/reconnect)');
   if (botSpeaking && BARGE_IN) {
     if (BARGE_CONFIRM) {
       // Duck, don't die: keep playing quietly and capture in parallel —
@@ -1598,7 +1632,7 @@ function onSpeakingStart(userId) {
     log('[recv] busy — edge during active capture (audio already flowing)');
     return;
   }
-  if (botSpeaking && !BARGE_CONFIRM) return;   // bot speaking, no barge-in configured — ignore
+  if (botSpeaking && !BARGE_CONFIRM) return gateDrop('bot speaking, barge-in off');
   handleUtterance(userId, conn.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: endSilenceMs() } }));
 }
 
