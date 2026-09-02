@@ -106,9 +106,15 @@ class Endpointer:
     """Pure end-of-speech state machine over per-window speech probabilities.
 
     Fires ONCE (``update`` returns True and stays True) when at least
-    ``min_speech_ms`` of speech has been seen and then probability stays below
-    ``neg_threshold`` continuously for ``min_silence_ms``. A short pre-speech
-    blip decays instead of latching, so it can't wedge endpointing off.
+    ``min_speech_ms`` of speech has been seen and then ``min_silence_ms`` of
+    sub-``neg_threshold`` windows have accumulated. Windows inside the
+    hysteresis band (between the two thresholds) are neutral: they neither
+    count as silence nor restart the silence clock — room noise hovering in
+    the band used to restart it every few windows, so two-thirds of real
+    utterances fell through to the fixed-timeout fallback. Only a window at
+    or above ``threshold`` (speech resumed) resets the clock. A short
+    pre-speech blip decays instead of latching, so it can't wedge
+    endpointing off.
     """
 
     def __init__(self, threshold=0.5, neg_threshold=None, min_silence_ms=300,
@@ -144,7 +150,6 @@ class Endpointer:
                 # never reached real speech — decay a spurious blip and re-arm
                 self.speech_ms = 0.0
                 self._silence_ms = 0.0
-        else:
-            # hysteresis band: treat as continuation of the current state
-            self._silence_ms = 0.0
+        # else: hysteresis band — neutral. Neither silence nor speech; the
+        # silence clock keeps whatever it had (see class docstring).
         return self.done

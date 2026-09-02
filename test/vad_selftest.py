@@ -84,6 +84,20 @@ check("done latches True", ep5.done is True and ep5.update(0.9) is True)
 ep6 = vad.Endpointer(threshold=0.6)
 check("neg_threshold default", abs(ep6.neg_threshold - 0.45) < 1e-9)
 
+# 7) hysteresis-band frames must not RESET the silence clock. Live: only a
+#    third of real utterances endpointed early — room noise hovering between
+#    neg_threshold and threshold restarted the clock every few windows, so the
+#    fixed 1s fallback ended most turns and the VAD's latency win never landed.
+probs7 = [0.9] * 10 + ([0.02] * 3 + [0.42] * 1) * 12   # a band frame every 4th window
+idx7, _ = run(probs7, threshold=0.5, min_silence_ms=300, min_speech_ms=150)
+check("band frames do not reset the silence clock", idx7 is not None)
+check("fires once ten silent windows accumulate around the band frames", idx7 is not None and 22 <= idx7 <= 26)
+
+# 8) ...and band frames do not COUNT as silence either: a band-only tail
+#    (speech trailing off, breath) never endpoints on its own.
+idx8, _ = run([0.9] * 10 + [0.42] * 60, threshold=0.5, min_silence_ms=300, min_speech_ms=150)
+check("band-only tail never endpoints", idx8 is None)
+
 # --- resampler math (numpy) -------------------------------------------------
 try:
     import numpy as np
