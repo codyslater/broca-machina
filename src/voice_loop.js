@@ -222,16 +222,20 @@ const SEMANTIC = (() => {
   return s.enabled === false ? null : { holdMs: s.holdMs || 4000 };
 })();
 // Hard connectives never end a thought — a Whisper period after "and." or
-// "the." is punctuation noise, not a sentence end. Prepositions are SOFT:
-// English sentences end on them constantly ("what we're working on.",
-// "turn it on."), so Whisper's terminal period is trusted there; without
-// one a trailing preposition still reads as mid-thought and holds.
-const HARD_CONNECTIVES = new Set(('and or but so because since although though if when while that which who ' +
-  'the a an my your his her its our their this these those ' +
+// "the." is punctuation noise, not a sentence end. Prepositions and OBJECT
+// pronouns are SOFT: English sentences end on them constantly ("what we're
+// working on.", "turn it on.", "go ahead and start it.", "thank you."), so
+// Whisper's terminal period is trusted there; without one a trailing
+// preposition or object pronoun still reads as mid-thought and holds. (Live
+// 2026-08-13..29: 26 holds, 0 joins — every trigger was "it."/"that."/"you."
+// sitting in the hard set, each costing holdMs for nothing.)
+const HARD_CONNECTIVES = new Set(('and or but because since although though if when while which who ' +
+  'the a an my your his its our their ' +
   'is are was were be being been am has have had do does did will would could should can may might must ' +
-  'i you we they he she it um uh like then also plus versus than as not very really just').split(' '));
+  'i we they he she um uh like plus versus than as not very really just').split(' '));
 const SOFT_CONNECTIVES = new Set(('to of in on at with for from by about into onto over under between ' +
-  'during before after').split(' '));
+  'during before after ' +
+  'it that this these those you them me him her us so then also too').split(' '));
 function looksIncomplete(text) {
   const t = String(text || '').trim();
   if (!t) return false;
@@ -443,6 +447,19 @@ const LONG_WAIT = (() => {
 let longWaitLastIdx = -1;
 function renderLongWaitPhrase(tpl, who) { return String(tpl).split('{who}').join(who); }
 const NOISE = new Set((CFG.sttNoiseDrop || ['', '.', 'you', 'thank you', 'thanks', 'bye', 'you.', 'thank you.']).map((s) => s.toLowerCase()));
+// Per-SENTENCE noise: Whisper's noise-loop signature is a stock phrase
+// repeated — "Thank you.  Thank you." — which dodges the whole-text list and
+// the >=3 repetition filter in stt.py (live 2026-08-25: held, then delivered
+// to the brain, seven times). A transcript whose every sentence is a noise
+// phrase or a sub-3-char fragment ("I.") is a hallucination, not a turn.
+function normNoise(s) { return String(s).toLowerCase().replace(/[\s.!?,;:]+$/, '').trim(); }
+const NOISE_NORM = new Set([...NOISE].map(normNoise).filter(Boolean));
+function isNoise(text) {
+  const t = String(text || '').trim();
+  if (t.length < 3 || NOISE.has(t.toLowerCase())) return true;
+  const sentences = t.split(/[.!?]+/).map(normNoise).filter(Boolean);
+  return sentences.length > 0 && sentences.every((x) => x.length < 3 || NOISE_NORM.has(x));
+}
 const TMPDIR = CFG.tmpDir || path.join(path.dirname(path.resolve(CFG_PATH)), '.voice-tmp');
 fs.mkdirSync(TMPDIR, { recursive: true });
 // Singleton guard: instances sharing a tmpDir share sockets AND the voice
@@ -802,7 +819,7 @@ function handleUtterance(userId, opus) {
       // Enrollment collects the AUDIO of utterances that pass the same
       // quality checks as real turns (non-empty STT = actual speech).
       const enrolling = SPEAKER_ENROLL && enrollNeeded();
-      if (enrolling && text && text.length >= 3 && !NOISE.has(text.toLowerCase())) {
+      if (enrolling && text && !isNoise(text)) {
         try {
           fs.mkdirSync(SPEAKER_ENROLL.enrollDir, { recursive: true });
           fs.copyFileSync(wav, path.join(SPEAKER_ENROLL.enrollDir, `sample_${utcTs()}.wav`));
@@ -811,7 +828,7 @@ function handleUtterance(userId, opus) {
       fs.unlink(wav, () => {});
       // Dropped utterance -> no dispatch -> no reply will ever come. Disarm the
       // ack or it would fire and promise a reply that never arrives.
-      if (!text || text.length < 3 || NOISE.has(text.toLowerCase())) {
+      if (!text || isNoise(text)) {
         // Phantom: give back the wait state this capture muted at start — the
         // previous turn's promise (ack arm + earcon gate) is still owed —
         // UNLESS an authoritative cancel landed mid-capture (aside verdict,
@@ -1872,7 +1889,7 @@ module.exports = {
     withinOneEdit, wakeStopwords: WAKE_STOPWORDS, channelIsHot,
     setReplyOwedForTest: (v) => { replyOwedAtCaptureStart = v; },
     enrollNeeded, getTurns: () => recentTurns.slice(), endSilenceMs, vadMinSilenceMs,
-    looksIncomplete, hasWakeWord,
+    looksIncomplete, hasWakeWord, isNoise,
     setBotSpeechEndedForTest: (v) => { lastBotSpeechEndedAt = v; },
     duckPlayback, restorePlayback, confirmBarge, armDuck, cancelArmedDuck,
     setResourceForTest: (r) => { currentRes = r; },
