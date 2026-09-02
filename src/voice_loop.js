@@ -1850,6 +1850,9 @@ client.on('error', (e) => log('[client] err', e.message));
 // 143-crash storm). Recovery: drop the poisoned modules from the require
 // cache and re-require — a fresh WASM instance with a clean heap. Decoders
 // are created per capture, so the next capture picks up the new module.
+// This is the FALLBACK path: package.json aliases the native '@discordjs/opus'
+// slot to mediaplex (see docs/ARCHITECTURE.md), which prism-media prefers, so
+// the WASM codec only runs where the native build is unavailable.
 let opusCrashTimes = [];
 function noteOpusCrash(err) {
   const msg = String((err && err.message) || err);

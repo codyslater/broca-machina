@@ -166,9 +166,16 @@ The fix, and why this project standardizes on it:
   resolves the correct **`@discordjs/voice` 0.19.2** (pinned in `package.json`) and `bun
   src/voice_loop.js` runs it. The `start` script and `scripts/voice-up.sh` both invoke `bun`.
 - **Pinned versions.** `package.json` pins `@discordjs/voice` to `0.19.2` and depends on
-  `@snazzah/davey`, plus `libsodium-wrappers` and `opusscript` (encryption/codec) and `prism-media`
-  (opus decode). A quick sanity check after install:
+  `@snazzah/davey`, plus `libsodium-wrappers` (encryption) and `prism-media` (opus encode/decode). A
+  quick sanity check after install:
   `cat node_modules/@discordjs/voice/package.json | grep version` should read `0.19.2`.
+- **Native opus.** `prism-media` loads the first opus backend it finds, preferring the
+  `@discordjs/opus` slot. `package.json` aliases that slot to **`mediaplex`** (a napi build, so it is
+  ABI-stable under bun) and keeps `opusscript` (WASM) as the fallback. The WASM codec corrupts its
+  shared heap under a loud-room edge storm ("Out of bounds memory access") and, because the voice
+  library's encoder shares that heap, takes playback down with it; the loop can reload its own
+  decoder module, but only a native codec removes the failure. `bun test/opus_native_selftest.mjs`
+  proves which backend loaded (`prism.opus.Encoder.type`).
 
 If you must run under Node, use Node ≥ 22.12 and verify the installed `@discordjs/voice` version — but
 bun is the supported and tested path.
