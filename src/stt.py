@@ -118,6 +118,25 @@ def transcribe(model, wav_path):
     return _apply_fixups(text)
 
 
+def speaker_score(wav_path):
+    """Voiceprint cosine score for one WAV against VOICE_SPEAKER_REF.
+
+    None when no voiceprint is configured or the gate faults — never a
+    made-up score. Callers treat None as "unknown": for the loop's echo-aware
+    duck that means "dim as before" (fail-open), exactly like transcribe()'s
+    gate allows on error.
+    """
+    ref = os.environ.get("VOICE_SPEAKER_REF", "").strip()
+    if not ref or not os.path.exists(ref):
+        return None
+    try:
+        import speaker
+        return float(speaker.score(wav_path, ref))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[speaker] score error: {exc}", file=sys.stderr)
+        return None
+
+
 def _repeated_sentence(text):
     """Return the sentence repeated >=3 times in text (normalized), else None."""
     counts = {}

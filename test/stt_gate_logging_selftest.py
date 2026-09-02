@@ -141,5 +141,62 @@ text, err, model = run_transcribe(score=0.77, threshold=0.5, segments=[
     seg("hello", no_speech=0.42, logprob=-0.61), seg("there", no_speech=0.15, logprob=-0.20)])
 check("confidence stats logged", "no_speech_max=0.42" in err and "logprob_min=-0.61" in err)
 
+# --- speaker-score op: the loop's echo-aware duck asks the WARM server for
+# a voiceprint score on the first ~0.8s of a capture BEFORE dimming playback
+# (live: 93 ducks -> 7 real interrupts; the bot's own audio bleeding back
+# into an open mic passes the sustain gate but never the voiceprint).
+import json
+import socket
+import subprocess
+import tempfile
+import threading
+
+import _voicesock as vs
+import stt_server
+
+fake = types.ModuleType("speaker")
+fake.score = lambda wav, ref: 0.77
+fake.threshold = lambda: 0.5
+sys.modules["speaker"] = fake
+os.environ["VOICE_SPEAKER_REF"] = __file__
+h = stt_server.make_handler(FakeModel())
+r = h({"wav": "/x.wav", "op": "speaker"})
+check("server op=speaker: returns the score, no transcription", r.get("ok") is True and abs(r.get("score") - 0.77) < 1e-9 and "text" not in r)
+r = h({"wav": "/x.wav"})
+check("server default op: still transcribes", r.get("ok") is True and r.get("text") == "hello there")
+os.environ.pop("VOICE_SPEAKER_REF", None)
+r = h({"wav": "/x.wav", "op": "speaker"})
+check("server op=speaker without a voiceprint: not ok", r.get("ok") is False)
+fake.score = lambda wav, ref: (_ for _ in ()).throw(RuntimeError("model missing"))
+os.environ["VOICE_SPEAKER_REF"] = __file__
+r = h({"wav": "/x.wav", "op": "speaker"})
+check("server op=speaker on a gate fault: not ok (never a fake score)", r.get("ok") is False)
+os.environ.pop("VOICE_SPEAKER_REF", None)
+
+# --- client --speaker-score: warm path only. A cold sherpa load is far too
+# slow for a duck decision, so a missing server means exit 1, empty stdout —
+# the loop then falls back to today's unconditional duck.
+CLIENT = os.path.join(os.path.dirname(__file__), "..", "src", "stt_client.py")
+tmpd = tempfile.mkdtemp()
+sock = os.path.join(tmpd, "stt.sock")
+env = dict(os.environ, VOICE_STT_SOCK=sock)
+env.pop("VOICE_SPEAKER_REF", None)
+proc = subprocess.run([sys.executable, CLIENT, "--speaker-score", "/x.wav"], env=env, capture_output=True, text=True, timeout=30)
+check("client --speaker-score with no server: exit 1", proc.returncode == 1)
+check("client --speaker-score with no server: empty stdout", proc.stdout.strip() == "")
+
+seen = {}
+def _serve():
+    vs.serve(sock, lambda req: (seen.update(req) or {"ok": True, "score": 0.42}) if req.get("op") == "speaker" else {"ok": True, "text": "x"})
+t = threading.Thread(target=_serve, daemon=True)
+t.start()
+for _ in range(50):
+    if os.path.exists(sock):
+        break
+    import time; time.sleep(0.05)
+proc = subprocess.run([sys.executable, CLIENT, "--speaker-score", "/x.wav"], env=env, capture_output=True, text=True, timeout=30)
+check("client --speaker-score: prints the server's score", proc.returncode == 0 and proc.stdout.strip() == "0.42")
+check("client --speaker-score: sends op=speaker with the absolute wav", seen.get("op") == "speaker" and seen.get("wav") == "/x.wav")
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

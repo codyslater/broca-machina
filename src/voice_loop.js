@@ -161,6 +161,24 @@ const SPEAKER_ENROLL = (() => {
   };
 })();
 function enrollNeeded() { return !!SPEAKER_ENROLL && !fs.existsSync(SPEAKER_ENROLL.refFile); }
+// Echo-aware duck (opt-in, speakerGate.duckCheckMs > 0, needs the voiceprint
+// and the warm STT server). The sustain gate cannot tell the bot's own audio
+// bleeding back into an open mic from speech — echo is still "capturing" at
+// 350ms — so nearly every reply dimmed for nothing (live since the sustain
+// gate: 93 ducks, 7 real interrupts). Before dimming, score the first
+// duckCheckMs of the capture against the voiceprint; only the enrolled voice
+// ducks. An unavailable score (server down, a cold stt.cmd that does not
+// know --speaker-score) ducks as before — fail-open toward today's behavior.
+const DUCK_CHECK = (() => {
+  const g = CFG.speakerGate;
+  if (!g || !g.refFile || !(g.duckCheckMs > 0)) return null;
+  const envThr = parseFloat((CFG.stt && CFG.stt.env && CFG.stt.env.VOICE_SPEAKER_THRESHOLD) || '');
+  return {
+    atMs: g.duckCheckMs,
+    minScore: g.duckCheckScore != null ? Number(g.duckCheckScore) : (Number.isFinite(envThr) ? envThr : 0.5),
+  };
+})();
+let activeCapture = null;   // { chunks } of the capture in flight — the duck check scores its head
 // Enrollment-aware endpointing: reflective answers include thinking pauses
 // that command-tuned endpointing reads as end-of-utterance — cutting the
 // speaker off mid-answer and letting the next prompt talk over the rest
@@ -787,6 +805,7 @@ function handleUtterance(userId, opus) {
   }
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   const chunks = [];
+  activeCapture = { chunks };
   let finalized = false;
   let monitor = null;
   let captureWatchdog = null;
@@ -812,6 +831,7 @@ function handleUtterance(userId, opus) {
     // junk-blob processing). Only the pipeline needs one-at-a-time
     // semantics; turnChain runs it in arrival order with the mic free.
     capturing = false;
+    if (activeCapture && activeCapture.chunks === chunks) activeCapture = null;
     const pcm = Buffer.concat(chunks);
     const run = turnChain.then(() => processTurn(pcm, reason));
     turnChain = run.catch((e) => log('[turn] process err', e.message));
@@ -1376,18 +1396,41 @@ function duckPlayback() {
   log('[barge] duck — confirming speech before interrupting');
 }
 // Arm the duck behind the sustain gate. `capturing` is the evidence that the speech is still
-// going when the timer fires; a blob that already ended never ducks at all.
+// going when the timer fires; a blob that already ended never ducks at all. With the echo-aware
+// check on, the timer waits for enough audio to score and the voiceprint decides.
+let duckCheckSeq = 0;   // bumped by every cancel so an in-flight score result cannot duck late
 function armDuck() {
   if (ducked || duckTimer) return;
-  if (!DUCK_AFTER_MS) { duckPlayback(); return; }
+  const checking = !!DUCK_CHECK && !enrollNeeded();
+  const wait = checking ? Math.max(DUCK_AFTER_MS, DUCK_CHECK.atMs) : DUCK_AFTER_MS;
+  if (!wait) { duckPlayback(); return; }
   duckTimer = setTimeout(() => {
     duckTimer = null;
-    if (capturing && botSpeaking) duckPlayback();
-    else log('[barge] speech did not sustain — no duck');
-  }, DUCK_AFTER_MS);
+    if (!(capturing && botSpeaking)) { log('[barge] speech did not sustain — no duck'); return; }
+    if (checking) duckIfEnrolledVoice(); else duckPlayback();
+  }, wait);
+}
+async function scoreCaptureSoFar() {
+  if (!activeCapture || !activeCapture.chunks.length) return null;
+  const wav = path.join(TMPDIR, `duck_${utcTs()}.wav`);
+  try {
+    await pcmToWav(Buffer.concat(activeCapture.chunks), wav);
+    const out = (await runCmd([...STT_CMD, '--speaker-score', wav], (CFG.stt && CFG.stt.env) || {}, 5000)).trim();
+    const score = parseFloat(out);
+    return Number.isFinite(score) ? score : null;
+  } catch { return null; } finally { fs.unlink(wav, () => {}); }
+}
+async function duckIfEnrolledVoice() {
+  const my = ++duckCheckSeq;
+  const score = await scoreCaptureSoFar();
+  if (my !== duckCheckSeq || !(capturing && botSpeaking)) return;   // a verdict or cancel landed meanwhile
+  if (score === null) { log('[barge] speaker score unavailable — ducking'); duckPlayback(); return; }
+  if (score >= DUCK_CHECK.minScore) { log(`[barge] enrolled voice (score ${score.toFixed(2)}) — ducking`); duckPlayback(); return; }
+  log(`[barge] not the enrolled voice (score ${score.toFixed(2)}) — playback continues`);
 }
 function cancelArmedDuck() {
   if (duckTimer) { clearTimeout(duckTimer); duckTimer = null; }
+  duckCheckSeq++;
 }
 function restorePlayback() {
   cancelArmedDuck();
@@ -2029,7 +2072,7 @@ module.exports = {
       botSpeaking, capturing, hasPendingReply: replyQueue.length > 0, replyQueueLen: replyQueue.length,
       hasPendingAck: !!pendingAck, earconActive, earconMuted, ducked, playbackTimeouts, playerGeneration,
     }),
-    cfg: { AUTO_JOIN, IDLE_LEAVE_MS, VAD: !!VAD, TTS_PIPE: !!TTS_PIPE, LOCAL_ACK: !!LOCAL_ACK, ACK_FIRE_MS, EARCON: !!EARCON, BARGE_CONFIRM, DUCK_AFTER_MS, DUCK_FACTOR, MAX_CAPTURE_MS, SPEAKER_ENROLL: !!SPEAKER_ENROLL, SEMANTIC: !!SEMANTIC, ADDRESS_GATE: !!ADDRESS_GATE },
+    cfg: { AUTO_JOIN, IDLE_LEAVE_MS, VAD: !!VAD, TTS_PIPE: !!TTS_PIPE, LOCAL_ACK: !!LOCAL_ACK, ACK_FIRE_MS, EARCON: !!EARCON, BARGE_CONFIRM, DUCK_AFTER_MS, DUCK_FACTOR, MAX_CAPTURE_MS, SPEAKER_ENROLL: !!SPEAKER_ENROLL, SEMANTIC: !!SEMANTIC, ADDRESS_GATE: !!ADDRESS_GATE, DUCK_CHECK: !!DUCK_CHECK },
     // TEST-ONLY seams for the local-ack sequencing selftest (never touched by
     // any production code path). setPlayerForTest injects a fake AudioPlayer
     // without a live Discord connection so pollReply()/playResource() run for

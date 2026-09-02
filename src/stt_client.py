@@ -2,6 +2,10 @@
 """broca-machina STT client — drop-in for stt.py.
 
 Same CLI:  stt_client.py <wav>   ->   transcript on stdout.
+Also:      stt_client.py --speaker-score <wav>   ->   voiceprint score on
+           stdout (warm server ONLY: a cold speaker-model load is far too
+           slow for the duck decision this feeds; no server -> exit 1,
+           empty stdout, and the loop dims playback as it always did).
 
 Sends the wav path to the warm `stt_server.py` over its Unix socket. If the
 socket is missing or the server is down/erroring, falls back to a cold
@@ -30,9 +34,24 @@ def _cold(wav):
     return stt.transcribe(stt.load_model(), wav)
 
 
+def _speaker_score(wav):
+    sock = os.environ.get("VOICE_STT_SOCK") or vs.default_sock_path(vs.DEFAULT_STT_SOCK)
+    resp = vs.request(sock, {"wav": os.path.abspath(wav), "op": "speaker"}, timeout=5.0)
+    if not resp.get("ok"):
+        raise RuntimeError(resp.get("error", "server error"))
+    return float(resp["score"])
+
+
 def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--speaker-score":
+        try:
+            sys.stdout.write(f"{_speaker_score(sys.argv[2]):.4g}\n")
+        except Exception as exc:  # noqa: BLE001 — unknown score, caller falls back
+            sys.stderr.write(f"[stt_client] speaker score unavailable ({type(exc).__name__}: {exc})\n")
+            return 1
+        return 0
     if len(sys.argv) < 2:
-        sys.stderr.write("usage: stt_client.py <wav>\n")
+        sys.stderr.write("usage: stt_client.py <wav> | --speaker-score <wav>\n")
         return 2
     wav = sys.argv[1]
     try:
