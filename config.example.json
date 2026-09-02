@@ -9,6 +9,7 @@
     "tokenEnv": "DISCORD_VOICE_BOT_TOKEN"
   },
 
+  "_sttBiasNote": "Recognition bias for names the model keeps guessing at (a wake word, a project): WHISPER_HOTWORDS (comma-separated; faster-whisper's decode-time hotword bias, the strongest lever), WHISPER_INITIAL_PROMPT (seed text for domain vocabulary), VOICE_STT_FIXUPS (JSON {mis-hearing: correction}, whole-word, applied after transcription). All empty by default; set them in stt.env.",
   "_sttModelNote": "WHISPER_MODEL is the STT speed/accuracy lever. Default small.en (most accurate on CPU). Set it to base.en for ~2.8x faster transcription with near-identical output on short utterances, or tiny.en for fastest/roughest — one env var, default unchanged. The warm stt_server.py reads it too (warm-servers.sh injects stt.env), so switch it here and restart the warm servers.",
   "stt": {
     "cmd": ["/path/to/python", "src/stt.py"],

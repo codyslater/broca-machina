@@ -171,7 +171,11 @@ Presence-gating adds `autoJoin`, `idleLeaveMs`, `presenceFile`, `onPresenceEnter
 The bundled engines read their own environment variables (set them via `stt.env` / `tts.env`):
 
 - **`src/stt.py`** (faster-whisper): `WHISPER_MODEL` (default `small.en`), `WHISPER_DEVICE`
-  (default `cpu`), `WHISPER_COMPUTE` (default `int8`). `WHISPER_MODEL` is the STT
+  (default `cpu`), `WHISPER_COMPUTE` (default `int8`). Recognition bias for names the model keeps
+  guessing at: `WHISPER_HOTWORDS` (comma-separated words the decoder is biased toward — the
+  strongest lever for a short wake word), `WHISPER_INITIAL_PROMPT` (seed text for domain
+  vocabulary), and `VOICE_STT_FIXUPS` (JSON `{"mis-hearing": "correction"}`, whole-word,
+  case-insensitive, applied after transcription). `WHISPER_MODEL` is the STT
   **speed/accuracy lever** — `base.en` transcribes ~2.8× faster than `small.en` with
   near-identical output on short utterances; `tiny.en` is faster still and rougher. Default
   stays `small.en`. The warm `stt_server.py` reads it too, so switch it in `stt.env` and restart

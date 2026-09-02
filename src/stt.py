@@ -10,6 +10,11 @@ the core stays generic — set them per-deployment via the adapter config stt.en
   WHISPER_INITIAL_PROMPT  seed text biasing the decoder toward your domain
                           vocabulary / rare names (e.g. a project or assistant
                           name the model would otherwise guess at)
+  WHISPER_HOTWORDS        comma-separated words faster-whisper biases toward
+                          at decode time (its `hotwords` option) — stronger
+                          than the prompt for a short name the model keeps
+                          guessing at (a wake word, a project); needs
+                          faster-whisper >= 1.0
   VOICE_STT_FIXUPS        JSON {mis-hearing: correction} — whole-word,
                           case-insensitive substitutions applied AFTER
                           transcription, the safety net for names that still
@@ -70,6 +75,9 @@ def transcribe(model, wav_path):
     prompt = os.environ.get("WHISPER_INITIAL_PROMPT", "").strip()
     if prompt:
         kwargs["initial_prompt"] = prompt
+    hotwords = os.environ.get("WHISPER_HOTWORDS", "").strip()
+    if hotwords:
+        kwargs["hotwords"] = hotwords
     segments, _ = model.transcribe(wav_path, **kwargs)
     segs = list(segments)
     if segs:

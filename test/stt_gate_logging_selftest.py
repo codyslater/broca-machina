@@ -95,6 +95,21 @@ text, err, model = run_transcribe(score=0.77, threshold=0.5)
 check("WHISPER_VAD_FILTER=1 keeps it on", model.kwargs.get("vad_filter") is True)
 os.environ.pop("WHISPER_VAD_FILTER", None)
 
+# --- WHISPER_HOTWORDS: faster-whisper's hotword bias ---
+# Stronger than initial_prompt for a short name the decoder keeps guessing at
+# (live: the wake word heard as four different near-misses, each a cold-drop
+# of a directly addressed turn). Unset or blank -> the kwarg is not passed.
+os.environ.pop("WHISPER_HOTWORDS", None)
+text, err, model = run_transcribe(score=0.77, threshold=0.5)
+check("hotwords: unset -> kwarg absent", "hotwords" not in model.kwargs)
+os.environ["WHISPER_HOTWORDS"] = "Juno, qPCR"
+text, err, model = run_transcribe(score=0.77, threshold=0.5)
+check("hotwords: env value passed to transcribe", model.kwargs.get("hotwords") == "Juno, qPCR")
+os.environ["WHISPER_HOTWORDS"] = "   "
+text, err, model = run_transcribe(score=0.77, threshold=0.5)
+check("hotwords: blank -> kwarg absent", "hotwords" not in model.kwargs)
+os.environ.pop("WHISPER_HOTWORDS", None)
+
 # --- repetition-hallucination drop ---
 # Observed live 2026-08-16 18:55Z: with vad_filter off, a 13.7s noise blob
 # decoded to "Thank you.  I.  Thank you.  Thank you." — passed the speaker
