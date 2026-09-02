@@ -5,6 +5,7 @@
 //   VOICE_NO_MAIN=1 DISCORD_VOICE_BOT_TOKEN=dummy bun test/earcon_selftest.mjs
 import { createRequire } from 'module';
 import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -14,10 +15,13 @@ const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vt-earcon-'));
 const earconWav = path.join(dir, 'thinking.wav');
+const sttOut = path.join(dir, 'stt_out');
+fs.writeFileSync(sttOut, '');
 fs.writeFileSync(earconWav, Buffer.alloc(400));   // content never decoded by the fake player
 const cfg = {
   discord: { guildId: 'g', channelId: 'c', allowedUserId: 'U1', tokenEnv: 'DISCORD_VOICE_BOT_TOKEN' },
-  stt: { cmd: ['true'] }, tts: { cmd: ['true'] },
+  // Fake STT: prints whatever the test staged in stt_out (empty = phantom).
+  stt: { cmd: ['bash', '-c', `cat ${sttOut} 2>/dev/null`] }, tts: { cmd: ['true'] },
   transport: { type: 'file', transcriptDir: path.join(dir, 'tx'), replyFile: path.join(dir, 'reply.txt') },
   ackAfterMs: 100,
   thinkingEarcon: { file: earconWav, afterMs: 100, volume: 0.15, maxMs: 2500 },
@@ -35,11 +39,20 @@ const T = mod.__test;
 // Fake AudioPlayer: playback "finishes" quickly so the earcon loop iterates.
 class FakePlayer extends EventEmitter {
   constructor() { super(); this.playCalls = 0; this.stopCalls = 0; this.delay = 15; }
-  play() { this.playCalls++; setTimeout(() => this.emit('stateChange', {}, { status: 'idle' }), this.delay); }
+  play(res) { this.playCalls++; this.lastRes = res; setTimeout(() => this.emit('stateChange', {}, { status: 'idle' }), this.delay); }
   stop() { this.stopCalls++; this.emit('stateChange', {}, { status: 'idle' }); }
 }
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+// Real opus silence for a fake subscription stream (the capture path decodes
+// what it is fed; ~0.6s clears minUtteranceSec).
+const prism = require(path.join(ROOT, 'node_modules', 'prism-media'));
+function feedSilence(pt, frames = 30) {
+  const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
+  enc.on('data', (pkt) => pt.write(pkt));
+  for (let i = 0; i < frames; i++) enc.write(Buffer.alloc(960 * 2 * 2));
+  enc.end();
+}
 let failed = 0;
 function check(name, cond) { console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}`); if (!cond) failed++; }
 
@@ -92,6 +105,46 @@ async function run() {
   check('cap: turn disarmed (no immediate retrigger)', T.ack.get() === 0);
   await delay(400);
   check('cap: stays off', T.state().earconActive === false);
+
+  // Mute-don't-stop (confirm mode). Live since 2026-08-29: 244 earcon starts,
+  // half under 3s — the capture path STOPPED the hum on every speaking edge
+  // and an open mic fires edges constantly, so the hum flapped on and off.
+  // Same principle as duck-don't-die: an edge MUTES the loop, a phantom
+  // verdict unmutes it (the turn is still owed), confirmed speech stops it.
+  {
+    const p2 = new FakePlayer();
+    T.setPlayerForTest(p2);
+    T.ack.set(Date.now() - 1000); T.acked.set(true);
+    T.pollReply();
+    await delay(500);
+    check('mute: earcon running before the edge', T.state().earconActive === true);
+    let wentOff = false;
+    const watch = setInterval(() => { if (!T.state().earconActive) wentOff = true; }, 20);
+    fs.writeFileSync(sttOut, '');                 // phantom verdict
+    const pt = new PassThrough();
+    T.handleUtterance('U1', pt);
+    await delay(60);
+    check('mute: edge mutes instead of stopping', T.state().earconActive === true && T.state().earconMuted === true);
+    check('mute: hum volume at zero while muted', !!(p2.lastRes && p2.lastRes.volume) && p2.lastRes.volume.volume === 0);
+    feedSilence(pt); await delay(150); pt.end();
+    await delay(1000);                            // phantom resolves
+    clearInterval(watch);
+    check('mute: phantom unmutes', T.state().earconMuted === false);
+    check('mute: earcon never went off across the phantom', wentOff === false && T.state().earconActive === true);
+    check('mute: hum volume restored', !!(p2.lastRes && p2.lastRes.volume) && p2.lastRes.volume.volume > 0);
+
+    const stopsBefore = p2.stopCalls;
+    fs.writeFileSync(sttOut, 'hello there friend');   // confirmed speech
+    const pt2 = new PassThrough();
+    T.handleUtterance('U1', pt2);
+    await delay(60);
+    check('mute: real speech also mutes first (verdict pending)', T.state().earconMuted === true && p2.stopCalls === stopsBefore);
+    feedSilence(pt2); await delay(150); pt2.end();
+    await delay(1000);
+    check('mute: confirmed speech stops the hum', p2.stopCalls > stopsBefore && T.state().earconMuted === false);
+    T.ack.set(0); T.acked.set(false);
+    await delay(300);
+  }
 
   // longWaitDue — pure predicate for the spoken "still working" notice on
   // long agent-brain waits (fires once per turn, between the earcon's start

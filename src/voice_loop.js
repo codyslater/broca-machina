@@ -753,7 +753,11 @@ function handleUtterance(userId, opus) {
   // on the delivery.)
   replyOwedAtCaptureStart = priorArmedAt;
   ackArmedAt = 0;
-  stopEarcon();   // instant cut — ambient "working" over (possible) speech reads as not listening
+  // Ambient "working" over (possible) speech reads as not listening — but
+  // the open mic fires edges constantly (live: 244 hum starts in three days,
+  // half under 3s), so in confirm mode the edge only MUTES the loop; the STT
+  // verdict unmutes (phantom) or stops (speech). Legacy mode keeps the cut.
+  if (BARGE_CONFIRM) muteEarcon(); else stopEarcon();
   if (!BARGE_CONFIRM) {
     ackGeneration++;
     if (pendingAck) { try { fs.unlinkSync(pendingAck.wav); } catch { /* */ } pendingAck = null; }
@@ -799,7 +803,8 @@ function handleUtterance(userId, opus) {
       const secs = pcm.length / (48000 * 2 * 2);
       if (secs < MIN_SEC) {
         log(`[recv] ${secs.toFixed(2)}s too short`);
-        if (BARGE_CONFIRM && ackCancels === priorCancels && !capturing) { ackArmedAt = priorArmedAt; ackedThisTurn = priorAcked; }
+        if (BARGE_CONFIRM && ackCancels === priorCancels && !capturing) { ackArmedAt = priorArmedAt; ackedThisTurn = priorAcked; unmuteEarcon(); }
+        else if (!capturing) stopEarcon();   // turn cancelled mid-capture: nothing is owed
         restorePlayback(); return;
       }
       // Arm the "still thinking" ack at end-of-speech — BEFORE STT — so the quick
@@ -833,11 +838,12 @@ function handleUtterance(userId, opus) {
         // previous turn's promise (ack arm + earcon gate) is still owed —
         // UNLESS an authoritative cancel landed mid-capture (aside verdict,
         // reply played, delivery failure): that promise is settled, stay dead.
-        if (BARGE_CONFIRM && ackCancels === priorCancels && !capturing) { ackArmedAt = priorArmedAt; ackedThisTurn = priorAcked; }
-        else ackArmedAt = 0;
+        if (BARGE_CONFIRM && ackCancels === priorCancels && !capturing) { ackArmedAt = priorArmedAt; ackedThisTurn = priorAcked; unmuteEarcon(); }
+        else { ackArmedAt = 0; if (!capturing) stopEarcon(); }
         log(`[stt] drop: "${text}"`); restorePlayback(); return;
       }
       log(`[stt] "${text}"`);
+      stopEarcon();   // a real turn arrived — the previous turn's hum is over
       // Real speech: NOW commit the turn-boundary resets deferred at capture
       // start — interrupt playback and queued tail, invalidate the previous
       // turn's in-flight ack, drop any held content-ack as stale.
@@ -1173,6 +1179,7 @@ let longWaitFiredFor = 0;
 // settles the in-flight playResource so the cut is immediate, not
 // end-of-file.
 let earconActive = false;
+let earconMuted = false;   // confirm mode: a speaking edge silences the loop until STT's verdict
 async function playEarconLoop() {
   if (earconActive || !EARCON) return;
   earconActive = true;
@@ -1180,8 +1187,10 @@ async function playEarconLoop() {
   const startedAt = Date.now();
   log('[earcon] start');
   try {
+    // While muted the turn's arm is 0 (capture start clears it); keep looping
+    // silently — the verdict either restores the arm or stops the loop.
     while (earconActive && connected && player && !botSpeaking
-           && !replyQueue.length && ackArmedAt === armedAtStart) {
+           && !replyQueue.length && (ackArmedAt === armedAtStart || earconMuted)) {
       if (Date.now() - startedAt >= EARCON.maxMs) {
         // A reply that never comes must not hum forever. Disarm the turn too,
         // or the due-check would restart the loop on the next poll tick.
@@ -1189,16 +1198,31 @@ async function playEarconLoop() {
         cancelAck();
         break;
       }
-      await playResource(fs.createReadStream(EARCON.file), EARCON.volume);
+      await playResource(fs.createReadStream(EARCON.file), EARCON.volume, { earcon: true });
     }
   } catch (e) { log('[earcon] err', e.message);
-  } finally { earconActive = false; }
+  } finally { earconActive = false; earconMuted = false; }
 }
 function stopEarcon() {
+  earconMuted = false;
   if (!earconActive) return;
   earconActive = false;
   try { if (player) player.stop(); } catch { /* */ }
   log('[earcon] stop');
+}
+function muteEarcon() {
+  if (!earconActive || earconMuted) return;
+  earconMuted = true;
+  try { if (currentRes && currentRes._earcon && currentRes.volume) currentRes.volume.setVolume(0); } catch { /* */ }
+  log('[earcon] muted — speaking edge, verdict pending');
+}
+function unmuteEarcon() {
+  if (!earconMuted) return;
+  earconMuted = false;
+  try {
+    if (currentRes && currentRes._earcon && currentRes.volume) currentRes.volume.setVolume((currentRes._base || 1) * (ducked ? DUCK_FACTOR : 1));
+  } catch { /* */ }
+  log('[earcon] unmuted — phantom');
 }
 
 // WHERE A REPLY GOES WHEN NOBODY IS LISTENING (CS 20260829).
@@ -1365,11 +1389,13 @@ function confirmBarge() {
   }
   if (replyQueue.length) { log(`[reply] dropped ${replyQueue.length} queued — user is speaking`); replyQueue = []; }
 }
-function playResource(stream, volume) {
+function playResource(stream, volume, opts) {
   return new Promise((resolve) => {
     const res = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
     res._base = volume || 1;
-    try { if (res.volume) res.volume.setVolume(res._base * (ducked ? DUCK_FACTOR : 1)); } catch { /* */ }
+    res._earcon = !!(opts && opts.earcon);
+    const gain = res._base * (ducked ? DUCK_FACTOR : 1) * (res._earcon && earconMuted ? 0 : 1);
+    try { if (res.volume) res.volume.setVolume(gain); } catch { /* */ }
     currentRes = res;
     let settled = false;
     const done = () => {
@@ -1790,7 +1816,7 @@ process.on('uncaughtException', (e) => {
   // leave the loop deaf (capturing stuck) or mute (botSpeaking stuck) — the
   // watchdog would eventually clear a capture, but a crash we SAW deserves an
   // immediate reset.
-  capturing = false; botSpeaking = false;
+  capturing = false; botSpeaking = false; stopEarcon();
   noteOpusCrash(e);
 });
 process.on('unhandledRejection', (e) => log('[fatal] unhandledRejection', (e && e.stack) || e));
@@ -1900,7 +1926,7 @@ module.exports = {
     state: () => ({
       connected, connecting, hasLeaveTimer: !!leaveTimer, presenceActive,
       botSpeaking, capturing, hasPendingReply: replyQueue.length > 0, replyQueueLen: replyQueue.length,
-      hasPendingAck: !!pendingAck, earconActive, ducked,
+      hasPendingAck: !!pendingAck, earconActive, earconMuted, ducked,
     }),
     cfg: { AUTO_JOIN, IDLE_LEAVE_MS, VAD: !!VAD, TTS_PIPE: !!TTS_PIPE, LOCAL_ACK: !!LOCAL_ACK, ACK_FIRE_MS, EARCON: !!EARCON, BARGE_CONFIRM, DUCK_AFTER_MS, DUCK_FACTOR, MAX_CAPTURE_MS, SPEAKER_ENROLL: !!SPEAKER_ENROLL, SEMANTIC: !!SEMANTIC, ADDRESS_GATE: !!ADDRESS_GATE },
     // TEST-ONLY seams for the local-ack sequencing selftest (never touched by
