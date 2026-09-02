@@ -264,7 +264,10 @@ absolute `cwd`, and point it at
 ```
 
 The **`speak`** tool is the *only* capability exposed to the host — it voices text and nothing else
-(no file or command access). Inbound speech uses an experimental `claude/channel` notification, so
+(no file or command access). Its result says what will happen to the text: `queued for speech`, or,
+when nobody is in the voice channel, that it will be posted to the `voiceFallback` text channel (or
+dropped if none is configured) — so a brain can write a reply that will be *read* differently from
+one that will be *heard*. Inbound speech uses an experimental `claude/channel` notification, so
 the MCP path is first-class with **Claude Code / channel-aware hosts** today; a host that can't
 receive channel events still gets `speak`. The `transport.deliver` switch is the extension seam for
 future generic-host inbound modes — see

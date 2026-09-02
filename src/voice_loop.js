@@ -1627,6 +1627,25 @@ async function deliverInboundMcp(text) {
   throw new Error(`transport.deliver='${mode}' not implemented (v1 supports 'channel')`);
 }
 
+// What `speak` will actually do with the text, told to the brain in the tool
+// result. It used to answer "queued for speech" no matter what: when nobody is
+// in the voice channel the loop posts the text to the fallback channel (or
+// drops it), and a reply someone will READ can be fuller than one they hear.
+// Mirrors speak()'s own two "nobody is listening" checks exactly.
+function speakOutcome() {
+  const gone = (!connected || !player) || (PRESENCE_FILE !== null && !presenceActive);
+  if (!gone) return 'queued for speech';
+  return VOICE_FALLBACK_CHANNEL
+    ? 'queued, but nobody is in the voice channel: it will be posted as text to the fallback channel, not spoken'
+    : 'queued, but nobody is in the voice channel and no fallback text channel is configured: it will be dropped';
+}
+async function handleSpeakCall(args) {
+  const text = String((args && args.text) || '').trim();
+  if (!text) return { isError: true, content: [{ type: 'text', text: 'speak: empty text' }] };
+  enqueueReply(text);
+  return { content: [{ type: 'text', text: speakOutcome() }] };
+}
+
 // transport.type === 'mcp': stand up an MCP stdio server so the loop IS the
 // bridge to the brain. Speech -> `notifications/claude/channel` (arrives as
 // <channel source="...">); reply <- `speak` tool -> enqueueReply -> playback.
@@ -1650,16 +1669,13 @@ async function initMcp() {
   mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [{
       name: 'speak',
-      description: 'Speak a reply aloud in the Discord voice channel (text-to-speech). Use only to answer a voice-channel (spoken) turn. Calls queue and play in order, so for a long answer call speak with the first paragraph IMMEDIATELY and keep composing — speech starts while you write the rest. If the user speaks again before a queued part plays, it is dropped (they moved on).',
+      description: 'Speak a reply aloud in the Discord voice channel (text-to-speech). Use only to answer a voice-channel (spoken) turn. Calls queue and play in order, so for a long answer call speak with the first paragraph IMMEDIATELY and keep composing — speech starts while you write the rest. If the user speaks again before a queued part plays, it is dropped (they moved on). The result says what will happen to the text: spoken, or (nobody in the voice channel) posted as text to a fallback channel — a reply that will be read can be fuller than one that will be heard.',
       inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'The reply text to voice.' } }, required: ['text'] },
     }],
   }));
   mcpServer.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (req.params.name !== 'speak') return { isError: true, content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }] };
-    const text = String((req.params.arguments && req.params.arguments.text) || '').trim();
-    if (!text) return { isError: true, content: [{ type: 'text', text: 'speak: empty text' }] };
-    enqueueReply(text);
-    return { content: [{ type: 'text', text: 'queued for speech' }] };
+    return handleSpeakCall(req.params.arguments);
   });
   await mcpServer.connect(new StdioServerTransport());
   log('[mcp] server connected (stdio), source=' + source);
@@ -2000,7 +2016,7 @@ module.exports = {
     withinOneEdit, wakeStopwords: WAKE_STOPWORDS, channelIsHot,
     setReplyOwedForTest: (v) => { replyOwedAtCaptureStart = v; },
     enrollNeeded, getTurns: () => recentTurns.slice(), endSilenceMs, vadMinSilenceMs,
-    looksIncomplete, hasWakeWord, isNoise, wavDurationMs, playSafetyMs, trimAck,
+    looksIncomplete, hasWakeWord, isNoise, wavDurationMs, playSafetyMs, trimAck, handleSpeakCall, speakOutcome,
     setBotSpeechEndedForTest: (v) => { lastBotSpeechEndedAt = v; },
     duckPlayback, restorePlayback, confirmBarge, armDuck, cancelArmedDuck,
     setResourceForTest: (r) => { currentRes = r; },
