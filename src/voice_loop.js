@@ -550,6 +550,26 @@ const LOCAL_ACK = (CFG.localAck && CFG.localAck.enabled === true) ? {
   fireAfterMs: CFG.localAck.fireAfterMs || 2000,
   contextTurns: CFG.localAck.contextTurns || 6,
 } : null;
+// Tier-1 ack hygiene. The small model sometimes emits two glued candidates
+// ("…now for you.Just piping you over…"), runs long, or claims an action the
+// ack layer is forbidden to take ("Transferring you to…") — all three played
+// live. One sentence, bounded, no action claim in its opening words; a claim
+// yields NO local ack, and the canned tier fires at the fire point instead.
+const ACK_MAX_WORDS = (CFG.localAck && CFG.localAck.maxWords) || 12;
+const ACK_ACTION_VERBS = /^(?:\S+\s+){0,2}(?:transferr?ing|connecting|switching|routing|handing|stopping|starting|restarting|pausing|resuming|cancell?ing|killing|launching|deploying|deleting|removing|installing|updating|sending|executing)\b/i;
+function trimAck(text, maxWords) {
+  const cap = maxWords || ACK_MAX_WORDS;
+  let t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  // First sentence only: an ender followed by whitespace, a capital (glued
+  // candidates), or the end. "1.5" and "e.g" do not split.
+  const m = t.match(/^(.*?[.!?])(?:\s|(?=[A-Z])|$)/);
+  if (m) t = m[1].trim();
+  const words = t.split(' ');
+  if (words.length > cap) t = words.slice(0, cap).join(' ').replace(/[,;:\s]+$/, '') + '.';
+  if (ACK_ACTION_VERBS.test(t)) return '';
+  return t;
+}
 // Rolling window of recent HEARD turns (user transcripts + replies that were
 // actually spoken) for the tier-1 ack: without it the local model sees four
 // words and invents a connection; with it the filler continues the live
@@ -1063,8 +1083,10 @@ async function dispatchLocalAck(text, myGeneration) {
     });
     if (!resp.ok) { log('[localAck] ollama http', resp.status); return; }
     const body = await resp.json();
-    const ackText = ((body && body.message && body.message.content) || '').trim();
-    if (!ackText) { log('[localAck] empty content'); return; }
+    const rawAck = ((body && body.message && body.message.content) || '').trim();
+    if (!rawAck) { log('[localAck] empty content'); return; }
+    const ackText = trimAck(rawAck);
+    if (!ackText) { log(`[localAck] dropped — action claim: "${rawAck.slice(0, 60)}"`); return; }
     // Stale-turn guard: the user may have started a new utterance (generation
     // bumped, see handleUtterance) while this call was in flight — a late ack
     // for an old turn must never queue.
@@ -1978,7 +2000,7 @@ module.exports = {
     withinOneEdit, wakeStopwords: WAKE_STOPWORDS, channelIsHot,
     setReplyOwedForTest: (v) => { replyOwedAtCaptureStart = v; },
     enrollNeeded, getTurns: () => recentTurns.slice(), endSilenceMs, vadMinSilenceMs,
-    looksIncomplete, hasWakeWord, isNoise, wavDurationMs, playSafetyMs,
+    looksIncomplete, hasWakeWord, isNoise, wavDurationMs, playSafetyMs, trimAck,
     setBotSpeechEndedForTest: (v) => { lastBotSpeechEndedAt = v; },
     duckPlayback, restorePlayback, confirmBarge, armDuck, cancelArmedDuck,
     setResourceForTest: (r) => { currentRes = r; },

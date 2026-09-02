@@ -223,6 +223,45 @@ async function run() {
     check('t6: botSpeaking settled', T.state().botSpeaking === false);
   }
 
+  // --- Test 7: trimAck — one sentence, bounded length, no action claims.
+  // Live 2026-08-30: "Connecting to X now for you.Just piping you over to X
+  // now." (two glued candidates) and "Transferring you to the analysis
+  // session." (an action the ack layer is forbidden to claim) both played.
+  {
+    check('exports trimAck', typeof T.trimAck === 'function');
+    const trim = typeof T.trimAck === 'function' ? T.trimAck : () => undefined;
+    check('t7: single clean sentence untouched', trim('Let me look into the R1 and R2 coverage for you.') === 'Let me look into the R1 and R2 coverage for you.');
+    check('t7: only the first sentence survives', trim('Checking on that run now. It should only take a moment.') === 'Checking on that run now.');
+    check('t7: glued candidates -> first one', trim('Having a look at the coverage now.Just pulling it up for you.') === 'Having a look at the coverage now.');
+    check('t7: over-long sentence cut at maxWords with a period',
+      trim('Right, let me pull up the latest numbers on the sequencing run and the alignment stats for the whole batch tonight')
+        === 'Right, let me pull up the latest numbers on the sequencing run.');
+    check('t7: action claim at the start is dropped', trim('Transferring you to the analysis session.') === '');
+    check('t7: action claim after a lead-in is dropped', trim("I'm restarting the server now.") === '');
+    check('t7: action verb deep in the sentence is fine', trim("Let me check on the deploy that's restarting.") === "Let me check on the deploy that's restarting.");
+    check('t7: empty stays empty', trim('') === '');
+
+    // dispatch path applies it: the model's glued/over-long text is trimmed
+    // before synthesis, and an action claim yields NO local ack (the canned
+    // tier fires at the fire point instead).
+    const fake = makeFakePlayer(80);
+    T.setPlayerForTest(fake);
+    T.ack.set(Date.now()); T.acked.set(false);
+    let content = 'Checking on that run now. It should only take a moment.';
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ message: { content } }) });
+    await T.dispatchLocalAck('how is the run', 0);
+    const pa = T.getPendingAck();
+    check('t7: dispatched ack text is the trimmed first sentence', !!pa && pa.text === 'Checking on that run now.');
+    if (pa) { try { fs.unlinkSync(pa.wav); } catch { /* */ } }
+    T.enqueueReply('drain the pending ack');   // two-clear retires it
+    await delay(400);
+    content = 'Transferring you to the analysis session.';
+    T.ack.set(Date.now()); T.acked.set(false);
+    await T.dispatchLocalAck('connect me to analysis', 0);
+    check('t7: action claim produces no local ack', T.getPendingAck() === null);
+    await delay(200);
+  }
+
   console.log(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`);
   process.exit(failed === 0 ? 0 : 1);
 }
