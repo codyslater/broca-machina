@@ -61,6 +61,8 @@
   "ttsPipeline": { "enabled": false, "minChars": 120, "maxChunkChars": 240 },
 
   "bargeIn": true,
+  "_interruptNote": "interruptContext (default true): after a confirmed barge-in, the NEXT transcript handed to the brain opens with a bracketed note quoting what the assistant was saying when the user cut in, so the brain knows the rest of that reply was never heard. One-shot, every transport. false = bare transcripts.",
+  "interruptContext": true,
   "_bargeConfirmNote": "Confirm-before-kill barge-in (default true when bargeIn is on). A speaking-start during bot playback DUCKS the audio to 30% and lets STT decide: real speech interrupts playback and drops any queued reply tail (classic barge-in), while a noise blob — breath, mic bump, the bot's own audio leaking into an open mic — just restores the volume, so phantom 'utterances' can no longer cut long replies off mid-sentence. Set false for the classic instant interrupt.",
   "bargeInConfirm": true,
   "_duckNote": "Duck depth and sustain gate (confirm mode). duckFactor is the playback volume while a speaking-start is being confirmed: 0.3 is a 70% cut, hard to listen through when false ducks are common (a noisy room) — raise it toward 0.55 there; the duck only has to be enough to hear over. duckAfterMs: a speaking-start must PERSIST this long before the duck lands, so a door, a chair or a mic bump never dims the reply at all, and a real interrupt costs this much full-volume overlap. 0 restores the old edge-triggered duck.",

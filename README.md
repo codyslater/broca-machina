@@ -140,6 +140,7 @@ Start from `config.example.json`. Every field the loop reads is listed below; fi
 | `minUtteranceSec` | number | `0.4` | Utterances shorter than this are discarded before STT. *optional* |
 | `maxReplyChars` | number | `700` | Reply text is truncated to this many characters before TTS. *optional* |
 | `bargeIn` | boolean | `true` | When `true`, the user speaking during a reply **interrupts** playback immediately (barge-in). *optional* |
+| `interruptContext` | boolean | `true` | After a confirmed interruption, the next transcript delivered to the brain opens with a bracketed note quoting what was being said when the user cut in (`[You were interrupted while saying: "…"] …`), on every transport, one-shot. Without it the brain believes the whole reply was heard. `false` sends the bare transcript. *optional* |
 | `bargeInConfirm` | boolean | `true` | Confirm-before-kill barge-in: a speaking-start **ducks** playback and STT decides — real speech interrupts, a noise blob restores the volume. `false` = classic instant interrupt. *optional* |
 | `bargeMinWords` | number | `4` | Confirm mode: a transcript only cuts playback if it has at least this many words, contains a wake word, or is a stop phrase (`stop`, `wait`, `hold on`…). Shorter turns still deliver. `0` disables the bar. *optional* |
 | `duckFactor` | number | `0.3` | Playback volume while a speaking-start is being confirmed. Raise toward `0.55` in a noisy room where false ducks are common. *optional* |

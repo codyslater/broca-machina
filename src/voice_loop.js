@@ -728,6 +728,21 @@ function setPresence(present) {
 }
 
 let botSpeaking = false, capturing = false, player;
+// After a confirmed interruption the brain still believes its whole reply
+// was heard and continues from there. The NEXT transcript carries what was
+// being said when the user cut in — one-shot, bounded, every transport.
+// interruptContext:false sends bare transcripts.
+const INTERRUPT_CONTEXT = CFG.interruptContext !== false;
+const INTERRUPT_NOTE_MAX_MS = 60000;
+let nowSpeaking = null;     // reply text (or pipelined chunk) being voiced right now; notices excluded
+let lastInterrupt = null;   // { text, at } from the latest confirmed barge, consumed by the next transcript
+function outboundText(text) {
+  if (!INTERRUPT_CONTEXT || !lastInterrupt) return text;
+  const li = lastInterrupt; lastInterrupt = null;
+  if (Date.now() - li.at > INTERRUPT_NOTE_MAX_MS) return text;
+  const said = li.text.length > 200 ? '…' + li.text.slice(-200) : li.text;
+  return `[You were interrupted while saying: "${said}"] ${text}`;
+}
 let ackedThisTurn = false;
 let ackArmedAt = 0;   // end-of-speech time of the current turn; arms the "still thinking" ack (0 = no turn)
 // Authoritative "no reply is coming / the promise is settled" disarm. Every
@@ -968,8 +983,9 @@ function handleUtterance(userId, opus) {
 // transport.out — deliver a transcript to the brain
 async function sendTranscript(text) {
   recordTurn('user', text);
+  const out = outboundText(text);
   if (T.type === 'command') {
-    const reply = (await runCmd([...T.cmd], { VOICE_TRANSCRIPT: text })).trim();
+    const reply = (await runCmd([...T.cmd], { VOICE_TRANSCRIPT: out })).trim();
     if (reply) enqueueReply(reply);
     else cancelAck();   // the brain finished with silence — nothing is coming; don't ack a reply that won't
   } else if (T.type === 'mcp') {
@@ -977,7 +993,7 @@ async function sendTranscript(text) {
     // the ONLY copy of the utterance, and even ungated a notify failure must
     // not lose it.
     if (T.transcriptDir) {
-      try { fs.writeFileSync(path.join(T.transcriptDir, `${utcTs()}.txt`), text); log('[out] -> transcriptDir (tee)'); }
+      try { fs.writeFileSync(path.join(T.transcriptDir, `${utcTs()}.txt`), out); log('[out] -> transcriptDir (tee)'); }
       catch (e) { log('[tee] err', e.message); }
     }
     if (T.gateFile && fs.existsSync(T.gateFile)) {
@@ -988,10 +1004,10 @@ async function sendTranscript(text) {
     }
     // Reply comes back via the `speak` tool (-> enqueueReply); the ack was
     // already armed at end-of-speech.
-    try { await deliverInboundMcp(text); }
+    try { await deliverInboundMcp(out); }
     catch (e) { log('[mcp] notify err', e.message); cancelAck(); }   // delivery failed -> no reply coming
   } else { // file
-    fs.writeFileSync(path.join(T.transcriptDir, `${utcTs()}.txt`), text);
+    fs.writeFileSync(path.join(T.transcriptDir, `${utcTs()}.txt`), out);
     log('[out] -> transcriptDir');
   }
 }
@@ -1325,7 +1341,7 @@ async function fallbackPost(text, why) {
   }
 }
 
-async function speak(text) {
+async function speak(text, opts) {
   // Two distinct "nobody is listening" states, both of which used to drop silently: the bot
   // is not in the channel at all, and the bot is in it but CS has left.
   if (!connected || !player) { recordTurn('assistant', text); await fallbackPost(text, 'not in channel'); return; }
@@ -1333,27 +1349,28 @@ async function speak(text) {
   recordTurn('assistant', text);
   if (TTS_PIPE && text.length >= TTS_PIPE_MIN_CHARS) {
     const parts = splitSentences(text, TTS_PIPE_MAX_CHUNK);
-    if (parts.length > 1) return speakPipelined(parts);
+    if (parts.length > 1) return speakPipelined(parts, opts);
   }
-  return speakSingle(text);
+  return speakSingle(text, opts);
 }
 
-async function speakSingle(text) {
+async function speakSingle(text, opts) {
   botSpeaking = true;
+  if (!(opts && opts.notice)) nowSpeaking = text;
   try {
     log(`[tts] "${text.slice(0, 70)}"`);
     const wav = await synthWav(text);
     if (!wav) { log('[tts] empty wav'); return; }
     await playResource(wav);
     fs.unlink(wav, () => {});
-  } finally { botSpeaking = false; markBotSpoke(); }
+  } finally { botSpeaking = false; nowSpeaking = null; markBotSpoke(); }
 }
 
 // Synthesize chunk N+1 while chunk N plays, then play chunks in order — so
 // time-to-first-audio is one sentence, not the whole reply. Barge-in (which
 // clears botSpeaking and stops the player) aborts the remaining chunks; any
 // already-started synth is drained + cleaned up in the finally.
-async function speakPipelined(parts) {
+async function speakPipelined(parts, opts) {
   botSpeaking = true;
   log(`[tts] pipelined ${parts.length} chunks: "${parts[0].slice(0, 50)}"`);
   let nextSynth = synthWav(parts[0]);
@@ -1362,12 +1379,14 @@ async function speakPipelined(parts) {
       const wav = await nextSynth;
       nextSynth = (i + 1 < parts.length) ? synthWav(parts[i + 1]) : null;
       if (!botSpeaking) { if (wav) fs.unlink(wav, () => {}); break; }   // barge-in before this chunk
+      if (!(opts && opts.notice)) nowSpeaking = parts[i];
       if (wav) { await playResource(wav); fs.unlink(wav, () => {}); }
       if (!botSpeaking) break;                                          // barge-in during this chunk
     }
   } finally {
     if (nextSynth) { try { const w = await nextSynth; if (w) fs.unlink(w, () => {}); } catch { /* */ } }
     botSpeaking = false;
+    nowSpeaking = null;
     markBotSpoke();
   }
 }
@@ -1445,6 +1464,7 @@ function confirmBarge() {
   ducked = false;
   if (hadPlayback) {
     log('[barge] confirmed — interrupting playback');
+    if (INTERRUPT_CONTEXT && nowSpeaking) lastInterrupt = { text: nowSpeaking, at: Date.now() };
     try { if (player) player.stop(true); } catch { /* */ }
     botSpeaking = false;
     // Interrupted speech still counts as recent assistant speech: the very
@@ -1626,7 +1646,7 @@ function pollReply() {
         const li = pickAckIndex(LONG_WAIT.phrases.length, longWaitLastIdx, Math.random());
         longWaitLastIdx = li;
         log(`[longwait] notice — reply still pending (waiting on ${who})`);
-        speak(renderLongWaitPhrase(LONG_WAIT.phrases[li], who)).finally(() => setTimeout(pollReply, 200)); return;
+        speak(renderLongWaitPhrase(LONG_WAIT.phrases[li], who), { notice: true }).finally(() => setTimeout(pollReply, 200)); return;
       }
       // Ack fired, reply still cooking — fill the silence with the ambient
       // loop (fire-and-forget: the poller keeps ticking, and any reply branch
