@@ -1095,7 +1095,7 @@ async function dispatchLocalAck(text, myGeneration) {
 async function speakLocalAck(ack) {
   if (!connected || !player) { try { fs.unlinkSync(ack.wav); } catch { /* */ } return; }
   botSpeaking = true;
-  try { log(`[localAck] speaking "${ack.text}"`); await playResource(fs.createReadStream(ack.wav)); }
+  try { log(`[localAck] speaking "${ack.text}"`); await playResource(ack.wav); }
   finally { botSpeaking = false; markBotSpoke(); fs.unlink(ack.wav, () => {}); }
 }
 
@@ -1145,7 +1145,7 @@ async function speakAck() {
   const phrase = ACK_PHRASES[idx];
   if (wav && fs.existsSync(wav)) {
     botSpeaking = true;
-    try { log(`[ack] "${phrase}"`); await playResource(fs.createReadStream(wav)); }
+    try { log(`[ack] "${phrase}"`); await playResource(wav); }
     finally { botSpeaking = false; markBotSpoke(); }
   } else {
     await speak(phrase);               // render failed earlier — synth on the fly (correct, just slower)
@@ -1198,7 +1198,7 @@ async function playEarconLoop() {
         cancelAck();
         break;
       }
-      await playResource(fs.createReadStream(EARCON.file), EARCON.volume, { earcon: true });
+      await playResource(EARCON.file, EARCON.volume, { earcon: true });
     }
   } catch (e) { log('[earcon] err', e.message);
   } finally { earconActive = false; earconMuted = false; }
@@ -1302,7 +1302,7 @@ async function speakSingle(text) {
     log(`[tts] "${text.slice(0, 70)}"`);
     const wav = await synthWav(text);
     if (!wav) { log('[tts] empty wav'); return; }
-    await playResource(fs.createReadStream(wav));
+    await playResource(wav);
     fs.unlink(wav, () => {});
   } finally { botSpeaking = false; markBotSpoke(); }
 }
@@ -1320,7 +1320,7 @@ async function speakPipelined(parts) {
       const wav = await nextSynth;
       nextSynth = (i + 1 < parts.length) ? synthWav(parts[i + 1]) : null;
       if (!botSpeaking) { if (wav) fs.unlink(wav, () => {}); break; }   // barge-in before this chunk
-      if (wav) { await playResource(fs.createReadStream(wav)); fs.unlink(wav, () => {}); }
+      if (wav) { await playResource(wav); fs.unlink(wav, () => {}); }
       if (!botSpeaking) break;                                          // barge-in during this chunk
     }
   } finally {
@@ -1389,30 +1389,91 @@ function confirmBarge() {
   }
   if (replyQueue.length) { log(`[reply] dropped ${replyQueue.length} queued — user is speaking`); replyQueue = []; }
 }
-function playResource(stream, volume, opts) {
+// WAV duration from the RIFF header (fmt byte rate + data chunk size). It
+// sizes the playback safety window: a flat 60s meant a wedged player cost a
+// full minute of dead air PER playback (live 2026-08-29: four in a row, the
+// whole visit). null = not a parseable WAV (the cap applies).
+function wavDurationMs(file) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    let buf = Buffer.alloc(4096);
+    try { buf = buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, 0)); }
+    finally { fs.closeSync(fd); }
+    if (buf.length < 12 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
+    const fileSize = fs.statSync(file).size;
+    let off = 12, byteRate = 0, dataSize = null;
+    while (off + 8 <= buf.length) {
+      const id = buf.toString('ascii', off, off + 4);
+      const size = buf.readUInt32LE(off + 4);
+      if (id === 'fmt ' && off + 20 <= buf.length) byteRate = buf.readUInt32LE(off + 16);
+      if (id === 'data') { dataSize = (size === 0 || size === 0xFFFFFFFF) ? Math.max(0, fileSize - off - 8) : size; break; }
+      off += 8 + size + (size & 1);
+    }
+    if (!byteRate || dataSize === null) return null;
+    return Math.round((dataSize / byteRate) * 1000);
+  } catch { return null; }
+}
+// Safety window for one playback: the clip's own length plus a margin, never
+// under a small floor (buffering + ffmpeg spin-up) and never over the cap.
+const PLAY_SAFETY_FLOOR_MS = 5000, PLAY_SAFETY_MARGIN_MS = 3000;
+function playSafetyMs(durationMs, cap) {
+  const c = cap || PLAY_TIMEOUT_MS;
+  if (durationMs == null || !(durationMs >= 0)) return c;
+  return Math.min(c, Math.max(Math.min(PLAY_SAFETY_FLOOR_MS, c), durationMs + PLAY_SAFETY_MARGIN_MS));
+}
+// Consecutive safety timeouts. One can be a slow buffer; two in a row is a
+// wedged AudioPlayer (live 2026-08-29: every playback after a rejoin hit the
+// timeout until the user left) — replace it on the live connection.
+let playbackTimeouts = 0;
+let playerGeneration = 0;
+function wirePlayer() {
+  player = createAudioPlayer();
+  player.on('error', (e) => log('[player] err', e.message));
+  if (conn && typeof conn.subscribe === 'function') conn.subscribe(player);
+  playerGeneration++;
+}
+function recreatePlayer() {
+  try { if (player) player.stop(true); } catch { /* */ }
+  wirePlayer();
+  log('[player] recreated — repeated playback timeouts');
+}
+function playResource(file, volume, opts) {
   return new Promise((resolve) => {
-    const res = createAudioResource(stream, { inputType: StreamType.Arbitrary, inlineVolume: true });
+    // Captured, not the global: teardown (idle-leave, a drop) nulls `player`
+    // while a playback can still be settling — live 2026-08-29 that settle
+    // dereferenced null, threw, and the promise never resolved.
+    const p = player;
+    if (!p) { resolve(); return; }
+    const res = createAudioResource(fs.createReadStream(file), { inputType: StreamType.Arbitrary, inlineVolume: true });
     res._base = volume || 1;
     res._earcon = !!(opts && opts.earcon);
     const gain = res._base * (ducked ? DUCK_FACTOR : 1) * (res._earcon && earconMuted ? 0 : 1);
     try { if (res.volume) res.volume.setVolume(gain); } catch { /* */ }
     currentRes = res;
+    const ms = playSafetyMs(wavDurationMs(file), PLAY_TIMEOUT_MS);
     let settled = false;
-    const done = () => {
+    const done = (healthy) => {
       if (settled) return; settled = true;
-      clearTimeout(safety); player.off('stateChange', onState); player.off('error', onErr);
+      clearTimeout(safety);
+      try { p.off('stateChange', onState); p.off('error', onErr); } catch { /* */ }
       if (currentRes === res) currentRes = null;
+      if (healthy) playbackTimeouts = 0;
       resolve();
     };
     // Settle on ANY arrival at a terminal state — not just the playing->idle edge.
     // Barge-in stop during buffering, a decode error on a bad WAV, or a connection
     // autopause would otherwise never resolve this promise and would wedge
     // botSpeaking=true forever (bot goes deaf + mute until restart).
-    const onState = (o, n) => { if (n.status === 'idle' || n.status === 'autopaused') done(); };
-    const onErr = (e) => { log('[player] err', e.message); done(); };
-    const safety = setTimeout(() => { log('[tts] playback safety timeout'); done(); }, PLAY_TIMEOUT_MS);
-    player.on('stateChange', onState); player.on('error', onErr);
-    player.play(res);
+    const onState = (o, n) => { if (n.status === 'idle' || n.status === 'autopaused') done(true); };
+    const onErr = (e) => { log('[player] err', e.message); done(false); };
+    const safety = setTimeout(() => {
+      playbackTimeouts++;
+      log(`[tts] playback safety timeout after ${ms}ms (player ${p.state && p.state.status}, streak ${playbackTimeouts})`);
+      if (playbackTimeouts >= 2 && player === p && connected) recreatePlayer();
+      done(false);
+    }, ms);
+    p.on('stateChange', onState); p.on('error', onErr);
+    p.play(res);
   });
 }
 
@@ -1518,7 +1579,7 @@ function pollPlayWav() {
   try {
     if (connected && player && !botSpeaking && fs.existsSync(PLAYWAV)) {
       const wav = fs.readFileSync(PLAYWAV, 'utf8').trim(); fs.unlinkSync(PLAYWAV);
-      if (wav && fs.existsSync(wav)) { botSpeaking = true; playResource(fs.createReadStream(wav)).finally(() => { botSpeaking = false; setTimeout(pollPlayWav, 200); }); return; }
+      if (wav && fs.existsSync(wav)) { botSpeaking = true; playResource(wav).finally(() => { botSpeaking = false; setTimeout(pollPlayWav, 200); }); return; }
     }
   } catch (e) { log('[playwav] err', e.message); }
   setTimeout(pollPlayWav, 400);
@@ -1638,8 +1699,7 @@ async function realConnect() {
     }
   });
   await entersState(conn, VoiceConnectionStatus.Ready, 20000);
-  player = createAudioPlayer(); player.on('error', (e) => log('[player] err', e.message));
-  conn.subscribe(player);
+  wirePlayer();
   conn.receiver.speaking.on('start', onSpeakingStart);
 }
 function realDisconnect() {
@@ -1915,7 +1975,7 @@ module.exports = {
     withinOneEdit, wakeStopwords: WAKE_STOPWORDS, channelIsHot,
     setReplyOwedForTest: (v) => { replyOwedAtCaptureStart = v; },
     enrollNeeded, getTurns: () => recentTurns.slice(), endSilenceMs, vadMinSilenceMs,
-    looksIncomplete, hasWakeWord, isNoise,
+    looksIncomplete, hasWakeWord, isNoise, wavDurationMs, playSafetyMs,
     setBotSpeechEndedForTest: (v) => { lastBotSpeechEndedAt = v; },
     duckPlayback, restorePlayback, confirmBarge, armDuck, cancelArmedDuck,
     setResourceForTest: (r) => { currentRes = r; },
@@ -1926,7 +1986,7 @@ module.exports = {
     state: () => ({
       connected, connecting, hasLeaveTimer: !!leaveTimer, presenceActive,
       botSpeaking, capturing, hasPendingReply: replyQueue.length > 0, replyQueueLen: replyQueue.length,
-      hasPendingAck: !!pendingAck, earconActive, earconMuted, ducked,
+      hasPendingAck: !!pendingAck, earconActive, earconMuted, ducked, playbackTimeouts, playerGeneration,
     }),
     cfg: { AUTO_JOIN, IDLE_LEAVE_MS, VAD: !!VAD, TTS_PIPE: !!TTS_PIPE, LOCAL_ACK: !!LOCAL_ACK, ACK_FIRE_MS, EARCON: !!EARCON, BARGE_CONFIRM, DUCK_AFTER_MS, DUCK_FACTOR, MAX_CAPTURE_MS, SPEAKER_ENROLL: !!SPEAKER_ENROLL, SEMANTIC: !!SEMANTIC, ADDRESS_GATE: !!ADDRESS_GATE },
     // TEST-ONLY seams for the local-ack sequencing selftest (never touched by
