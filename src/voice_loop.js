@@ -1372,6 +1372,10 @@ async function speakSingle(text, opts) {
 // already-started synth is drained + cleaned up in the finally.
 async function speakPipelined(parts, opts) {
   botSpeaking = true;
+  // Claim the floor for chunk 0 BEFORE its synthesis: a barge confirmed inside
+  // that window (live 2026-09-03 23:35:20Z) is a real interruption of this
+  // reply — the user never hears it — and the note must name it.
+  if (!(opts && opts.notice)) nowSpeaking = parts[0];
   log(`[tts] pipelined ${parts.length} chunks: "${parts[0].slice(0, 50)}"`);
   let nextSynth = synthWav(parts[0]);
   try {

@@ -17,7 +17,8 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vt-interrupt-'));
 const queueFile = path.join(dir, 'stt_lines');
 fs.writeFileSync(queueFile, '');
 const ttsStub = path.join(dir, 'tts_stub.sh');
-fs.writeFileSync(ttsStub, '#!/usr/bin/env bash\nhead -c 200 /dev/zero > "$2" 2>/dev/null || true\n');
+const holdFile = path.join(dir, 'HOLD');   // while present, synthesis blocks
+fs.writeFileSync(ttsStub, `#!/usr/bin/env bash\nwhile [ -f "${holdFile}" ]; do sleep 0.05; done\nhead -c 200 /dev/zero > "$2" 2>/dev/null || true\n`);
 fs.chmodSync(ttsStub, 0o755);
 const cfg = {
   discord: { guildId: 'g', channelId: 'c', allowedUserId: 'U1', tokenEnv: 'DISCORD_VOICE_BOT_TOKEN' },
@@ -25,6 +26,9 @@ const cfg = {
   tts: { cmd: ['bash', ttsStub] },
   transport: { type: 'file', transcriptDir: path.join(dir, 'tx'), replyFile: path.join(dir, 'reply.txt') },
   duckAfterMs: 50,
+  // pipelined so the note quotes the CHUNK being spoken; two-sentence replies
+  // split deterministically at the sentence boundary under a 50-char cap
+  ttsPipeline: { enabled: true, minChars: 40, maxChunkChars: 50 },
   semanticEndpoint: { enabled: false },
   tmpDir: path.join(dir, 'vtmp'),
 };
@@ -80,8 +84,8 @@ async function run() {
   T.setPresence(true);
 
   // A reply is being voiced...
-  const reply = 'The first reply is long enough that the user will cut in halfway through it.';
-  T.enqueueReply(reply);
+  const first = 'First sentence of the reply, spoken first.';
+  T.enqueueReply(`${first} Second sentence of the reply follows after that.`);
   T.pollReply();
   await delay(300);
   check('reply is playing', p.plays === 1 && T.state().botSpeaking === true);
@@ -92,12 +96,28 @@ async function run() {
   check('barge: transcript delivered', delivered().length === 1);
   const tx1 = lastTx() || '';
   check('barge: transcript opens with the interrupt note', /^\[You were interrupted while saying: "/.test(tx1));
-  check('barge: note quotes what was being said', tx1.includes(reply));
+  check('barge: note quotes the chunk being spoken', tx1.includes(`"${first}"`));
   check('barge: the utterance itself follows the note', tx1.endsWith('okay please stop reading that now'));
 
   // The note is one-shot: the next turn is plain.
   await utter('and now a normal follow up question');
   check('next turn: plain transcript, no note', lastTx() === 'and now a normal follow up question');
+
+  // Live 2026-09-03 23:35:20Z: the verdict landed while the pipelined reply's
+  // FIRST chunk was still synthesizing — botSpeaking was already true, the
+  // barge was confirmed, but nothing had been marked as "being said" yet, so
+  // the brain got a bare transcript. Hold synthesis, interrupt, release.
+  fs.writeFileSync(holdFile, '');
+  const held = 'Held reply that never reaches the speaker.';
+  T.enqueueReply(`${held} Its second sentence would have followed.`);
+  await delay(400);                                  // picked up, stuck in synth
+  check('held: reply claimed the floor before any audio', T.state().botSpeaking === true && p.plays === 1);
+  await utter('please stop talking right now');
+  fs.unlinkSync(holdFile);
+  await delay(400);
+  const tx3 = lastTx() || '';
+  check('held: interruption during synthesis still produces the note', tx3.includes(`"${held}"`));
+  check('held: nothing played after the interrupt', p.plays === 1 && T.state().botSpeaking === false);
 
   // A phantom edge over playback that STT rejects is not an interruption.
   T.enqueueReply('Another reply the user does not interrupt.');
