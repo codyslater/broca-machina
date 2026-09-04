@@ -862,15 +862,15 @@ function handleUtterance(userId, opus) {
         else if (!capturing) stopEarcon();   // turn cancelled mid-capture: nothing is owed
         restorePlayback(); return;
       }
-      // Arm the "still thinking" ack at end-of-speech — BEFORE STT — so the quick
-      // acknowledgement overlaps STT + brain time instead of waiting them out.
-      // LOCAL_ACK arms too: its fire gate reads ackArmedAt even when the canned
-      // tier is configured off.
-      // Never arm while a NEW capture is rolling: the user is already talking
-      // again, so there is no dead air for a filler to cover — firing one
-      // would talk over them (entry-mute already happened; this arm would
-      // undo it).
-      if ((ACK_AFTER_MS || LOCAL_ACK) && !capturing) { ackArmedAt = Date.now(); ackedThisTurn = false; }
+      // The ack's arm TIME is end-of-speech — so the filler overlaps STT +
+      // brain time instead of waiting them out — but it is PUBLISHED only once
+      // STT confirms real speech (below). A provisional arm set here was
+      // visible to the next overlapping capture as "prior owed state": three
+      // phantoms in a row restored one of their own arms, and a filler, the
+      // earcon and a long-wait notice fired for a turn that never existed
+      // (live 2026-09-04 00:09:47Z). LOCAL_ACK arms too: its fire gate reads
+      // ackArmedAt even when the canned tier is configured off.
+      const armAt = (ACK_AFTER_MS || LOCAL_ACK) ? Date.now() : 0;
       const wav = path.join(TMPDIR, `utt_${utcTs()}.wav`);
       await pcmToWav(pcm, wav);
       presenceUtterances++;
@@ -899,6 +899,11 @@ function handleUtterance(userId, opus) {
       }
       log(`[stt] "${text}"`);
       stopEarcon();   // a real turn arrived — the previous turn's hum is over
+      // Never arm while a NEW capture is rolling: the user is already talking
+      // again, so there is no dead air for a filler to cover — firing one
+      // would talk over them (entry-mute already happened; this arm would
+      // undo it).
+      if (armAt && !capturing) { ackArmedAt = armAt; ackedThisTurn = false; }
       // Real speech: NOW commit the turn-boundary resets deferred at capture
       // start — interrupt playback and queued tail, invalidate the previous
       // turn's in-flight ack, drop any held content-ack as stale.

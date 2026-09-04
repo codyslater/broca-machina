@@ -18,10 +18,12 @@ const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vt-resilience-'));
 const sttOut = path.join(dir, 'stt_out');
+const sttDelay = path.join(dir, 'stt_delay');   // optional seconds to sleep before answering
 const cfg = {
   discord: { guildId: 'g', channelId: 'c', allowedUserId: 'U1', tokenEnv: 'DISCORD_VOICE_BOT_TOKEN' },
-  // Fake STT: prints whatever the test staged in stt_out (ignores the wav arg).
-  stt: { cmd: ['bash', '-c', `cat ${sttOut} 2>/dev/null`] },
+  // Fake STT: prints whatever the test staged in stt_out (ignores the wav arg),
+  // after sleeping stt_delay seconds when that file exists.
+  stt: { cmd: ['bash', '-c', `sleep $(cat ${sttDelay} 2>/dev/null || echo 0); cat ${sttOut} 2>/dev/null`] },
   tts: { cmd: ['true'] },
   transport: { type: 'file', transcriptDir: path.join(dir, 'tx'), replyFile: path.join(dir, 'reply.txt') },
   maxCaptureSec: 0.3,       // watchdog fires fast in the test
@@ -104,6 +106,30 @@ async function run() {
   } else {
     check('cancel-race: phantom does not resurrect cancelled ack', false);
     check('cancel-race: too-short does not resurrect cancelled ack', false);
+  }
+
+  // --- (2d) overlapping phantoms must not resurrect one of their own arms ---
+  // Live 2026-09-04 00:09:47Z: three empty captures in a row, each opening
+  // while the previous one was still in STT. The arm was set BEFORE STT, so
+  // the next capture saw it as "prior owed state" and, when its own verdict
+  // was phantom, restored it — a filler, the earcon and a long-wait notice all
+  // fired for a turn that never existed.
+  {
+    fs.writeFileSync(sttOut, '');
+    fs.writeFileSync(sttDelay, '0.4');
+    T.ack.set(0); T.acked.set(false);
+    const open = async (startMs, endMs) => {
+      await delay(startMs);
+      const c = new PassThrough(); T.handleUtterance('U1', c); feedSilence(c);
+      await delay(endMs - startMs); c.end();
+    };
+    const t0 = Date.now();
+    await open(0, 150);                       // A: verdict lands with nobody capturing
+    await open(300 - (Date.now() - t0), 450 - (Date.now() - t0) + 150);   // B: armed alone, C opens during its STT
+    await open(700 - (Date.now() - t0), 850 - (Date.now() - t0) + 150);   // C: phantom, restores "prior" = B's arm
+    await delay(1600);
+    check('phantom chain: no arm survives (no filler for a dead turn)', T.ack.get() === 0 && T.acked.get() === false);
+    fs.unlinkSync(sttDelay);
   }
 
   // --- (2b) confirmed speech: resets commit, transcript delivered ------------
